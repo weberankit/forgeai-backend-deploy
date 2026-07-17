@@ -8,6 +8,7 @@ import { runSmokeRenderTests } from '../services/review/testingAgent.js';
 import { runQualityReview } from '../services/review/reviewAgent.js';
 import { generateProjectFiles, repairGenerationBatch } from '../services/generation/codeGenerationService.js';
 import { applyNaturalLanguageEdit } from '../services/edit/editAgent.js';
+import { explainProjectQuestion } from '../services/explain/explainAgent.js';
 import { buildDependencyGraph } from '../services/review/dependencyGraph.js';
 import { repairMissingRelativeImports } from '../services/generation/importRepair.js';
 import { resolveEditTargets } from '../services/edit/editTargeting.js';
@@ -257,6 +258,38 @@ test('keeps dependency graph synced after generation', async () => {
   assert.ok(project.dependencyGraph['src/App.jsx'].imports.includes('src/pages/HomePage.jsx'));
 });
 
+
+
+test('explains a specifically referenced file with function-level detail', async () => {
+  const project = {
+    generatedFiles: [
+      { path: 'src/App.jsx', language: 'jsx', content: "import HomePage from './pages/HomePage.jsx'; function handleCheckout(){ return true; } export default function App(){ return <button onClick={handleCheckout}><HomePage /></button> }" },
+      { path: 'src/pages/HomePage.jsx', language: 'jsx', content: 'export default function HomePage(){ return <main /> }' }
+    ],
+    dependencyGraph: buildDependencyGraph([
+      { path: 'src/App.jsx', content: "import HomePage from './pages/HomePage.jsx'; function handleCheckout(){ return true; } export default function App(){ return <button onClick={handleCheckout}><HomePage /></button> }" },
+      { path: 'src/pages/HomePage.jsx', content: 'export default function HomePage(){ return <main /> }' }
+    ])
+  };
+  const explanation = await explainProjectQuestion(project, 'explain src/App.jsx in detail');
+  assert.equal(explanation.importantFiles[0].path, 'src/App.jsx');
+  assert.match(JSON.stringify(explanation), /handleCheckout/);
+  assert.ok(explanation.functionDetails.some((item) => item.name === 'handleCheckout'));
+});
+
+
+test('explain agent changes response mode for flow and code requests', async () => {
+  const files = [
+    { path: 'src/App.jsx', language: 'jsx', content: "import HomePage from './pages/HomePage.jsx'; function handleFilter(){ return true; } export default function App(){ return <HomePage onFilter={handleFilter} /> }" },
+    { path: 'src/pages/HomePage.jsx', language: 'jsx', content: 'export default function HomePage(){ return <main /> }' }
+  ];
+  const project = { generatedFiles: files, dependencyGraph: buildDependencyGraph(files) };
+  const flow = await explainProjectQuestion(project, 'create flow for this app');
+  const code = await explainProjectQuestion(project, 'explain code in detail');
+  assert.equal(flow.mode, 'flow');
+  assert.equal(code.mode, 'code');
+  assert.match(code.directAnswer, /code-level/);
+});
 
 test('applies graph-targeted natural language edits with fallback in mock mode', async () => {
   const project = {

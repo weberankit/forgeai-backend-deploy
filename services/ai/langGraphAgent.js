@@ -4,6 +4,7 @@ import { buildPlanningPrompt } from './prompts/planningPrompt.js';
 import { buildCodeGenerationPrompt } from './prompts/codeGenerationPrompt.js';
 import { buildGenerationRepairPrompt } from './prompts/generationRepairPrompt.js';
 import { buildEditPrompt } from './prompts/editPrompt.js';
+import { buildExplainPrompt } from './prompts/explainPrompt.js';
 import { parseStructuredResponse, validateBlueprint, validateExpansionSpec } from './parseStructuredResponse.js';
 
 const AgentState = Annotation.Root({
@@ -26,6 +27,8 @@ const AgentState = Annotation.Root({
   validationError: Annotation(),
   generatedFiles: Annotation(),
   attempt: Annotation(),
+  graphSummary: Annotation(),
+  fallbackExplanation: Annotation(),
   onToken: Annotation(),
   result: Annotation()
 });
@@ -60,6 +63,12 @@ const generationRepairGraph = new StateGraph(AgentState)
   .addEdge('generation_repair_agent', END)
   .compile();
 
+const explainGraph = new StateGraph(AgentState)
+  .addNode('explain_agent', explainNode)
+  .addEdge(START, 'explain_agent')
+  .addEdge('explain_agent', END)
+  .compile();
+
 export async function runExpansionGraph({ prompt, imageDescription, fallback, onToken }) {
   const state = await expansionGraph.invoke({
     task: 'expansion',
@@ -89,6 +98,17 @@ export async function runEditGraph({ project, message, targetFiles, dependencyCo
     message,
     targetFiles,
     dependencyContext,
+    fallbackResult: fallback
+  });
+  return state.result;
+}
+
+export async function runExplainGraph({ question, graphSummary, fallback }) {
+  const state = await explainGraph.invoke({
+    task: 'explain',
+    message: question,
+    graphSummary,
+    fallbackExplanation: fallback,
     fallbackResult: fallback
   });
   return state.result;
@@ -171,6 +191,21 @@ async function editNode(state) {
   return { result };
 }
 
+async function explainNode(state) {
+  const prompt = buildExplainPrompt({
+    question: state.message,
+    graphSummary: state.graphSummary,
+    fallbackExplanation: state.fallbackExplanation
+  });
+  const result = await callStructuredAgent({
+    operation: 'explain',
+    prompt,
+    fallbackResult: state.fallbackResult,
+    validator: validateExplainResponse
+  });
+  return { result };
+}
+
 async function generationRepairNode(state) {
   const prompt = buildGenerationRepairPrompt({
     specification: state.specification,
@@ -226,7 +261,7 @@ async function callStructuredAgent({ operation, prompt, fallbackResult, validato
     } catch (error) {
       console.warn('LangGraph structured agent output failed', { operation, attempt, message: error.message });
       if (attempt === 2) {
-        if ((operation === 'code_generation' || operation === 'generation_repair' || operation === 'edit') && fallbackResult) return fallbackResult;
+        if ((operation === 'code_generation' || operation === 'generation_repair' || operation === 'edit' || operation === 'explain') && fallbackResult) return fallbackResult;
         throw error;
       }
     }
@@ -314,5 +349,14 @@ function validateEditResponse(value) {
     if (typeof change.content !== 'string' || change.content.length === 0) return { valid: false, message: 'change.content is required' };
   }
   if (!Array.isArray(value.warnings)) return { valid: false, message: 'warnings must be an array' };
+  return { valid: true };
+}
+
+function validateExplainResponse(value) {
+  if (!value || typeof value !== 'object') return { valid: false, message: 'explanation must be an object' };
+  if (typeof value.title !== 'string') return { valid: false, message: 'title is required' };
+  if (typeof value.directAnswer !== 'string') return { valid: false, message: 'directAnswer is required' };
+  if (!Array.isArray(value.flow)) return { valid: false, message: 'flow must be an array' };
+  if (!Array.isArray(value.importantFiles)) return { valid: false, message: 'importantFiles must be an array' };
   return { valid: true };
 }

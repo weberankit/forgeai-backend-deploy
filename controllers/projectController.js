@@ -32,6 +32,62 @@ async function findVisitorProject(projectId, visitorId) {
   return project;
 }
 
+function writeSse(res, event, data) {
+  res.write('event: ' + event + '\n');
+  res.write('data: ' + JSON.stringify(data) + '\n\n');
+}
+
+function startSse(res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.flushHeaders?.();
+}
+
+export async function expandProjectStream(req, res, next) {
+  startSse(res);
+  try {
+    const chatId = String(req.body.chatId || '').trim();
+    const prompt = String(req.body.prompt || '').trim();
+    if (!chatId) throw httpError(400, 'chatId is required.');
+    if (prompt.length < 8) throw httpError(400, 'Prompt must be at least 8 characters.');
+
+    const chat = await findVisitorChat(chatId, req.visitorId);
+    const imageDescription = await describeImage(req.file);
+    const expandedSpec = await expandSpecification({ prompt, imageDescription, onToken: (token) => writeSse(res, 'token', { token }) });
+
+    const project = await Project.create({
+      projectId: randomUUID(),
+      chatId,
+      visitorId: req.visitorId,
+      name: expandedSpec.projectName,
+      originalPrompt: prompt,
+      imageMetadata: imageDescription?.metadata || null,
+      expandedSpec,
+      approvalStatus: 'draft',
+      status: 'spec_ready'
+    });
+
+    chat.title = expandedSpec.projectName || chat.title;
+    chat.messages.push({
+      messageId: randomUUID(),
+      role: 'assistant',
+      type: 'specification',
+      content: 'Expanded specification ready for ' + expandedSpec.projectName + '.',
+      metadata: { projectId: project.projectId }
+    });
+    await chat.save();
+    writeSse(res, 'final', { project: serializeProject(project), imageDescription });
+    res.end();
+  } catch (error) {
+    writeSse(res, 'error', { message: error.message });
+    res.end();
+  }
+}
+
 export async function expandProject(req, res, next) {
   try {
     const chatId = String(req.body.chatId || '').trim();
@@ -68,6 +124,46 @@ export async function expandProject(req, res, next) {
     res.status(201).json({ project: serializeProject(project), imageDescription });
   } catch (error) {
     next(error);
+  }
+}
+
+export async function planProjectStream(req, res, next) {
+  startSse(res);
+  try {
+    const projectId = String(req.body.projectId || '').trim();
+    if (!projectId) throw httpError(400, 'projectId is required.');
+
+    const project = await findVisitorProject(projectId, req.visitorId);
+    const specification = req.body.specification || project.expandedSpec;
+    if (!specification) throw httpError(400, 'Specification is required.');
+
+    const blueprint = await planFrontendProject({
+      specification,
+      clarification: req.body.clarification,
+      onToken: (token) => writeSse(res, 'token', { token })
+    });
+
+    project.expandedSpec = specification;
+    project.blueprint = blueprint;
+    project.approvalStatus = 'draft';
+    project.clarification = String(req.body.clarification || '');
+    project.status = 'planned';
+    await project.save();
+
+    const chat = await findVisitorChat(project.chatId, req.visitorId);
+    chat.messages.push({
+      messageId: randomUUID(),
+      role: 'assistant',
+      type: 'blueprint',
+      content: 'Blueprint generated for ' + project.name + '.',
+      metadata: { projectId: project.projectId }
+    });
+    await chat.save();
+    writeSse(res, 'final', { project: serializeProject(project) });
+    res.end();
+  } catch (error) {
+    writeSse(res, 'error', { message: error.message });
+    res.end();
   }
 }
 

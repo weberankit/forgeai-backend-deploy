@@ -3,3 +3,4 @@ export function httpError(status, message) {
   error.status = status;
   return error;
 }
+ 

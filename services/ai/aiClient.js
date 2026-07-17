@@ -1,18 +1,20 @@
 import { runExpansionGraph, runPlanningGraph } from './langGraphAgent.js';
 
-export async function expandSpecification({ prompt, imageDescription }) {
+export async function expandSpecification({ prompt, imageDescription, onToken }) {
   return runExpansionGraph({
     prompt,
     imageDescription,
-    fallback: mockExpansion(prompt, imageDescription)
+    fallback: mockExpansion(prompt, imageDescription),
+    onToken
   });
 }
 
-export async function planFrontendProject({ specification, clarification }) {
+export async function planFrontendProject({ specification, clarification, onToken }) {
   return runPlanningGraph({
     specification,
     clarification,
-    fallback: mockBlueprint(specification)
+    fallback: mockBlueprint(specification),
+    onToken
   });
 }
 

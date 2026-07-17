@@ -3,6 +3,7 @@ import {
   deployProject,
   editProject,
   expandProject,
+  expandProjectStream,
   explainProject,
   fixProject,
   generateProject,
@@ -14,6 +15,7 @@ import {
   getProjectReviews,
   getVerifiedFixSuggestions,
   planProject,
+  planProjectStream,
   regenerateProject,
   restoreProject,
   reviewProject,
@@ -27,7 +29,9 @@ const router = Router();
 router.use(requireVisitor);
 router.get('/memory/verified-fixes', getVerifiedFixSuggestions);
 router.get('/deployments/:deploymentId/status', getDeploymentStatus);
+router.post('/expand/stream', uploadImage.single('image'), expandProjectStream);
 router.post('/expand', uploadImage.single('image'), expandProject);
+router.post('/plan/stream', planProjectStream);
 router.post('/plan', planProject);
 router.get('/:projectId', getProject);
 router.get('/:projectId/files', getProjectFiles);

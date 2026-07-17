@@ -16,6 +16,7 @@ const AgentState = Annotation.Root({
   contracts: Annotation(),
   warnings: Annotation(),
   fallbackResult: Annotation(),
+  onToken: Annotation(),
   result: Annotation()
 });
 
@@ -37,22 +38,24 @@ const codeGenerationGraph = new StateGraph(AgentState)
   .addEdge('code_generation_agent', END)
   .compile();
 
-export async function runExpansionGraph({ prompt, imageDescription, fallback }) {
+export async function runExpansionGraph({ prompt, imageDescription, fallback, onToken }) {
   const state = await expansionGraph.invoke({
     task: 'expansion',
     prompt,
     imageDescription,
-    fallbackResult: fallback
+    fallbackResult: fallback,
+    onToken
   });
   return state.result;
 }
 
-export async function runPlanningGraph({ specification, clarification, fallback }) {
+export async function runPlanningGraph({ specification, clarification, fallback, onToken }) {
   const state = await planningGraph.invoke({
     task: 'planning',
     specification,
     clarification,
-    fallbackResult: fallback
+    fallbackResult: fallback,
+    onToken
   });
   return state.result;
 }
@@ -77,7 +80,8 @@ async function expansionNode(state) {
     operation: 'expansion',
     prompt,
     fallbackResult: state.fallbackResult,
-    validator: validateExpansionSpec
+    validator: validateExpansionSpec,
+    onToken: state.onToken
   });
   return { result };
 }
@@ -88,7 +92,8 @@ async function planningNode(state) {
     operation: 'planning',
     prompt,
     fallbackResult: state.fallbackResult,
-    validator: validateBlueprint
+    validator: validateBlueprint,
+    onToken: state.onToken
   });
   return { result };
 }
@@ -111,11 +116,12 @@ async function codeGenerationNode(state) {
   return { result };
 }
 
-async function callStructuredAgent({ operation, prompt, fallbackResult, validator }) {
+async function callStructuredAgent({ operation, prompt, fallbackResult, validator, onToken }) {
   const provider = process.env.AI_PROVIDER || 'mock';
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
-      const raw = provider === 'openai' ? await callOpenAI(prompt) : JSON.stringify(fallbackResult);
+      const raw = provider === 'openai' ? await callOpenAI(prompt, { onToken }) : JSON.stringify(fallbackResult);
+      if (provider !== 'openai' && onToken) onToken(raw);
       return parseStructuredResponse(raw, validator);
     } catch (error) {
       console.warn('LangGraph structured agent output failed', { operation, attempt, message: error.message });
@@ -124,7 +130,7 @@ async function callStructuredAgent({ operation, prompt, fallbackResult, validato
   }
 }
 
-async function callOpenAI(prompt) {
+async function callOpenAI(prompt, { onToken } = {}) {
   if (!process.env.OPENAI_API_KEY) {
     throw new Error('OPENAI_API_KEY is required when AI_PROVIDER=openai.');
   }
@@ -136,12 +142,54 @@ async function callOpenAI(prompt) {
     },
     body: JSON.stringify({
       model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
-      input: prompt
+      input: prompt,
+      stream: Boolean(onToken)
     })
   });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error?.message || 'OpenAI request failed');
+  }
+  if (onToken) return readOpenAIStream(response, onToken);
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error?.message || 'OpenAI request failed');
   return data.output_text || data.output?.flatMap((item) => item.content || []).map((part) => part.text).join('\n');
+}
+
+async function readOpenAIStream(response, onToken) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let output = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split('\n\n');
+    buffer = parts.pop() || '';
+    for (const part of parts) {
+      for (const line of part.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        const event = JSON.parse(payload);
+        const delta = event.delta || event.text || event?.item?.content?.[0]?.text || '';
+        if (event.type === 'response.output_text.delta' && delta) {
+          output += delta;
+          onToken(delta);
+        }
+        if (event.type === 'response.completed') {
+          const finalText = event.response?.output_text || event.response?.output?.flatMap((item) => item.content || []).map((content) => content.text || '').join('\n');
+          if (finalText && finalText.length > output.length) {
+            const tail = finalText.slice(output.length);
+            output = finalText;
+            onToken(tail);
+          }
+        }
+      }
+    }
+  }
+  return output;
 }
 
 function validateCodeGenerationResponse(value) {

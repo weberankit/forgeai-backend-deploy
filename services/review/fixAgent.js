@@ -6,6 +6,7 @@ import { storeVerifiedFixCandidate } from '../memory/verifiedFixMemory.js';
 
 export async function runFixLoop(project, { runtimeOutput = '', maxAttempts = 3 } = {}) {
   const runs = [];
+  let pendingVerifiedFix = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const review = await runQualityReview({ project, runtimeOutput, attempt });
     runs.push(review);
@@ -13,6 +14,16 @@ export async function runFixLoop(project, { runtimeOutput = '', maxAttempts = 3 
     if (review.status === 'passed') {
       project.operationStatus = 'review_passed';
       project.dependencyGraph = review.staticValidation.graph;
+      if (pendingVerifiedFix) {
+        await storeVerifiedFixCandidate({
+          project,
+          review: pendingVerifiedFix.review,
+          fixChanges: pendingVerifiedFix.changes,
+          validationPassed: true,
+          previewEvidence: ['review agent passed after fix attempt ' + pendingVerifiedFix.attempt]
+        }).catch((error) => console.warn('Verified-fix memory store skipped', { message: error.message }));
+        pendingVerifiedFix = null;
+      }
       await project.save();
       return { status: 'passed', review, attempts: runs };
     }
@@ -31,7 +42,7 @@ export async function runFixLoop(project, { runtimeOutput = '', maxAttempts = 3 
     project.operationStatus = validation.passed ? 'fix_applied' : 'fix_validation_failed';
     if (validation.passed) {
       addVerifiedFix(project, fixResult, review);
-      await storeVerifiedFixCandidate({ project, review, fixChanges: fixResult.changes, validationPassed: true, previewEvidence: ['review fix loop validation passed'] }).catch((error) => console.warn('Verified-fix memory store skipped', { message: error.message }));
+      pendingVerifiedFix = { review, changes: fixResult.changes, attempt };
     }
     await project.save();
   }

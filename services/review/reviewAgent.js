@@ -1,12 +1,16 @@
 import { randomUUID } from 'crypto';
 import { runStaticValidation } from './staticValidation.js';
+import { runSmokeRenderTests } from './testingAgent.js';
 
 export async function runQualityReview({ project, runtimeOutput = '', attempt = 1, changedFiles = null }) {
   const staticValidation = runStaticValidation(project.generatedFiles || []);
+  const smokeRenderTest = runSmokeRenderTests(project.generatedFiles || []);
   const findings = [];
   let id = 1;
   for (const error of staticValidation.errors) findings.push(toFinding(id++, 'blocker', 'build', error));
   for (const warning of staticValidation.warnings) findings.push(toFinding(id++, warning.code === 'circular_import' ? 'medium' : 'low', 'maintainability', warning));
+  for (const error of smokeRenderTest.errors) findings.push(toFinding(id++, 'blocker', 'smoke_render', error));
+  for (const warning of smokeRenderTest.warnings) findings.push(toFinding(id++, 'low', 'smoke_render', warning));
   if (/error|failed|exception/i.test(runtimeOutput || '')) {
     findings.push({
       id: formatId(id++), severity: 'high', category: 'runtime', title: 'Runtime output contains an error',
@@ -19,7 +23,7 @@ export async function runQualityReview({ project, runtimeOutput = '', attempt = 
   return {
     reviewId: randomUUID(), attempt, status, summary, findings,
     filesNeedingChanges: [...new Set(findings.flatMap((finding) => [finding.file, ...(finding.relatedFiles || [])]).filter(Boolean))],
-    verificationCommands: ['npm run build'], staticValidation, runtimeOutput, createdAt: new Date()
+    verificationCommands: ['npm run build', 'smoke render test'], staticValidation: { ...staticValidation, smokeRenderTest }, runtimeOutput, createdAt: new Date()
   };
 }
 
@@ -36,6 +40,7 @@ function humanTitle(code) { return String(code || 'issue').replace(/_/g, ' ').re
 function recommended(code) {
   if (code === 'missing_relative_import') return 'Add the missing file or correct the import path.';
   if (code === 'parse_error' || code === 'jsx_parse_error') return 'Fix JavaScript or JSX syntax in the reported file.';
+  if (String(code || '').startsWith('smoke_')) return 'Fix the renderable React module so it can mount without missing imports, undefined components, or runtime crashes.';
   if (code === 'invalid_package_json') return 'Use only allowed frontend dependencies and safe scripts.';
   return 'Update the smallest affected generated file set.';
 }

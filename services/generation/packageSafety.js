@@ -1,6 +1,6 @@
 import { httpError } from '../../utils/httpError.js';
 
-const allowedDependencies = new Set([
+export const allowedDependencies = new Set([
   '@vitejs/plugin-react',
   'vite',
   'react',
@@ -11,7 +11,9 @@ const allowedDependencies = new Set([
   'tailwindcss',
   'postcss',
   'autoprefixer',
-  'lucide-react'
+  'lucide-react',
+  '@stripe/react-stripe-js',
+  '@stripe/stripe-js'
 ]);
 const blockedScriptNames = ['preinstall', 'install', 'postinstall', 'prepare', 'prepack', 'postpack'];
 
@@ -38,4 +40,31 @@ export function validatePackageJson(content) {
     }
   }
   return parsed;
+}
+
+export function sanitizePackageJson(content) {
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return content;
+  }
+  const removed = [];
+  for (const field of ['dependencies', 'devDependencies']) {
+    if (!parsed[field]) continue;
+    for (const dependencyName of Object.keys(parsed[field])) {
+      if (!allowedDependencies.has(dependencyName)) {
+        removed.push(dependencyName);
+        delete parsed[field][dependencyName];
+      }
+    }
+    if (Object.keys(parsed[field]).length === 0) delete parsed[field];
+  }
+  if (removed.length) {
+    parsed.aiFrontendEngineer = {
+      ...(parsed.aiFrontendEngineer || {}),
+      removedUnsupportedDependencies: removed
+    };
+  }
+  return JSON.stringify(parsed, null, 2) + '\n';
 }

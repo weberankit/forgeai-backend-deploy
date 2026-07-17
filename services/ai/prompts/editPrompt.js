@@ -1,0 +1,29 @@
+export function buildEditPrompt({ project, message, targetFiles, dependencyContext }) {
+  return [
+    'You are an Edit Agent for a generated frontend-only React/Vite project.',
+    '',
+    'Return strict JSON only. Do not include Markdown fences.',
+    '',
+    'Your job: apply the user edit request only to the provided target files. Preserve working imports and exports.',
+    'Do not add backend code, secrets, auth servers, databases, Docker, Express, MongoDB, JWT, OAuth, or Next.js.',
+    'If the user asks for third-party behavior, implement a frontend mock/local UI flow unless already present.',
+    '',
+    'Return this exact JSON shape:',
+    '{ "changes": [{ "path": "src/pages/HomePage.jsx", "content": "complete updated file content", "reason": "what changed" }], "warnings": [] }',
+    '',
+    'User edit request:',
+    message,
+    '',
+    'Project summary:',
+    JSON.stringify({ name: project?.name, expandedSpec: project?.expandedSpec, blueprint: project?.blueprint }, null, 2),
+    '',
+    'Dependency context from project graph:',
+    JSON.stringify(dependencyContext || {}, null, 2),
+    '',
+    'Known pitfalls to avoid from verified fix memory:',
+    dependencyContext?.knownPitfalls || 'No verified pitfalls matched this context.',
+    '',
+    'Target files with current content:',
+    JSON.stringify(targetFiles || [], null, 2)
+  ].join('\n');
+}

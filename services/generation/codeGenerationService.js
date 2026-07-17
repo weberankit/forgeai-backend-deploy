@@ -1,7 +1,12 @@
-import { runCodeGenerationGraph } from '../ai/langGraphAgent.js';
-import { buildGenerationBatches } from './generationBatches.js';
+import { runCodeGenerationGraph, runGenerationRepairGraph } from '../ai/langGraphAgent.js';
+import { buildAgentExecutionStages, buildGenerationBatches } from './generationBatches.js';
 import { languageForPath, normalizeProjectPath } from './pathSafety.js';
 import { mergeFiles, validateGeneratedFiles, validateGenerationBatch } from './generatedFileValidation.js';
+import { runSmokeRenderTests } from '../review/testingAgent.js';
+import { runFixLoop } from '../review/fixAgent.js';
+import { runStaticValidation } from '../review/staticValidation.js';
+import { repairMissingRelativeImports } from './importRepair.js';
+import { buildKnownPitfallsPrompt, retrieveVerifiedFixes } from '../memory/verifiedFixMemory.js';
 
 export function getGenerationPlan(blueprint) {
   return buildGenerationBatches(blueprint);
@@ -29,38 +34,84 @@ export async function generateProjectFiles(project, options = {}) {
 
     if (activeBatches.length === 0) throw new Error('No matching files were selected for generation.');
 
-    for (let index = 0; index < activeBatches.length; index += 1) {
-      const batch = activeBatches[index];
-      project.generationStatus = 'generating_batch';
-      project.currentBatch = batch.batchNumber;
-      project.generationProgress = Math.max(5, Math.round((index / activeBatches.length) * 80));
-      await project.save();
-
-      const fallback = mockGenerateBatch({ project, targetFiles: batch.files });
-      const generated = await runCodeGenerationGraph({
-        specification: project.expandedSpec,
-        blueprint: project.blueprint,
-        previousFiles: existingFiles,
-        targetFiles: batch.files,
-        contracts,
-        warnings,
-        fallback
-      });
-      validateGenerationBatch(generated.files, batch.files, existingFiles);
-      for (const warning of generated.warnings || []) warnings.push(warning);
-      for (const contract of generated.contracts || []) contracts.push(contract);
-      existingFiles = mergeFiles(existingFiles, generated.files);
-
-      project.generatedFiles = upsertGeneratedFiles(project.generatedFiles || [], generated.files);
-      project.generationWarnings = [...new Set(warnings)];
-      project.generationProgress = Math.max(project.generationProgress, Math.round(((index + 1) / activeBatches.length) * 85));
-      await project.save();
+    let completedBatches = 0;
+    const stages = buildAgentExecutionStages(activeBatches);
+    for (const stage of stages) {
+      if (stage.parallel) {
+        const stagePreviousFiles = existingFiles;
+        const stageContracts = [...contracts];
+        const stageWarnings = [...warnings];
+        project.generationStatus = 'generating_batch';
+        project.currentBatch = stage.batches[0]?.batchNumber || completedBatches + 1;
+        project.generationProgress = Math.max(5, Math.round((completedBatches / activeBatches.length) * 80));
+        await project.save();
+        const results = await Promise.all(stage.batches.map((batch) => runGenerationBatch({
+          project,
+          batch,
+          batchIndex: completedBatches,
+          totalBatches: activeBatches.length,
+          previousFiles: stagePreviousFiles,
+          contracts: stageContracts,
+          warnings: stageWarnings,
+          skipSave: true
+        })));
+        for (const { batch, generated } of results) {
+          const repairedGenerated = await repairGenerationBatch({ project, batch, generated, previousFiles: existingFiles, contracts, warnings });
+          for (const warning of repairedGenerated.warnings || []) warnings.push(warning);
+          for (const contract of repairedGenerated.contracts || []) contracts.push(contract);
+          existingFiles = repairMissingRelativeImports(mergeFiles(existingFiles, repairedGenerated.files));
+          project.generatedFiles = repairMissingRelativeImports(upsertGeneratedFiles(project.generatedFiles || [], repairedGenerated.files));
+          project.dependencyGraph = runStaticValidation(project.generatedFiles || []).graph;
+          completedBatches += 1;
+          project.generationWarnings = [...new Set(warnings)];
+          project.generationProgress = Math.max(project.generationProgress, Math.round((completedBatches / activeBatches.length) * 85));
+          await project.save();
+        }
+      } else {
+        for (const batch of stage.batches) {
+          const generated = await runGenerationBatch({
+            project,
+            batch,
+            batchIndex: completedBatches,
+            totalBatches: activeBatches.length,
+            previousFiles: existingFiles,
+            contracts,
+            warnings
+          });
+          const repairedGenerated = await repairGenerationBatch({ project, batch, generated, previousFiles: existingFiles, contracts, warnings });
+          for (const warning of repairedGenerated.warnings || []) warnings.push(warning);
+          for (const contract of repairedGenerated.contracts || []) contracts.push(contract);
+          existingFiles = repairMissingRelativeImports(mergeFiles(existingFiles, repairedGenerated.files));
+          project.generatedFiles = repairMissingRelativeImports(upsertGeneratedFiles(project.generatedFiles || [], repairedGenerated.files));
+          project.dependencyGraph = runStaticValidation(project.generatedFiles || []).graph;
+          completedBatches += 1;
+          project.generationWarnings = [...new Set(warnings)];
+          project.generationProgress = Math.max(project.generationProgress, Math.round((completedBatches / activeBatches.length) * 85));
+          await project.save();
+        }
+      }
     }
 
     project.generationStatus = 'validating';
     project.generationProgress = 90;
     await project.save();
+    project.generatedFiles = repairMissingRelativeImports(project.generatedFiles || []);
     validateGeneratedFiles(project.generatedFiles || []);
+    project.dependencyGraph = runStaticValidation(project.generatedFiles || []).graph;
+    let smokeRenderTest = runSmokeRenderTests(project.generatedFiles || []);
+    if (!smokeRenderTest.passed) {
+      const fixResult = await runFixLoop(project, {
+        runtimeOutput: 'Smoke/render test failed: ' + smokeRenderTest.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '),
+        maxAttempts: 3
+      });
+      if (fixResult.status !== 'passed') {
+        smokeRenderTest = runSmokeRenderTests(project.generatedFiles || []);
+        throw new Error('Smoke/render test failed after fix attempts: ' + smokeRenderTest.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
+      }
+      project.generatedFiles = repairMissingRelativeImports(project.generatedFiles || []);
+      validateGeneratedFiles(project.generatedFiles || []);
+      project.dependencyGraph = runStaticValidation(project.generatedFiles || []).graph;
+    }
 
     project.generationStatus = 'storing';
     project.generationProgress = 96;
@@ -80,6 +131,137 @@ export async function generateProjectFiles(project, options = {}) {
     await project.save();
     throw error;
   }
+}
+
+export async function repairGenerationBatch({ project, batch, generated, previousFiles, contracts, warnings, maxAttempts = 3 }) {
+  const fallback = mockGenerateBatch({ project, targetFiles: batch.files, batch });
+  let candidate = normalizeGenerationResult(generated);
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      validateGenerationBatch(candidate.files, batch.files, previousFiles);
+      validateBatchGraph(candidate.files, previousFiles);
+      if (attempt > 1) {
+        candidate.warnings = [
+          ...(candidate.warnings || []),
+          'Generation Repair Agent fixed batch ' + batch.batchNumber + ' after validation error: ' + lastError
+        ];
+      }
+      return candidate;
+    } catch (error) {
+      lastError = error.message;
+      if (attempt === maxAttempts) throw error;
+      const repairFallback = buildRepairFallback({ fallback, candidate, batch });
+      const repair = await runGenerationRepairGraph({
+        specification: project.expandedSpec,
+        blueprint: project.blueprint,
+        previousFiles,
+        targetFiles: batch.files,
+        generatedFiles: candidate.files,
+        validationError: error.message,
+        contracts,
+        warnings,
+        fallback: repairFallback,
+        agentName: batch.agentName,
+        phase: batch.phase,
+        dependencyContext: {
+          manager: 'Frontend Manager Agent',
+          repairOf: batch.agentName,
+          phase: batch.phase,
+          targetFiles: batch.files,
+          attempt
+        },
+        attempt
+      });
+      candidate = mergeGenerationRepair(candidate, repair, batch);
+    }
+  }
+  throw new Error(lastError || 'Generation repair failed.');
+}
+
+function validateBatchGraph(files, previousFiles) {
+  const candidatePaths = new Set((files || []).map((file) => normalizeProjectPath(file.path)));
+  const validation = runStaticValidation(mergeFiles(previousFiles || [], files || []));
+  const blocking = validation.errors.filter((error) => !error.file || candidatePaths.has(error.file));
+  if (blocking.length) {
+    throw new Error(blocking.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
+  }
+}
+
+function normalizeGenerationResult(result) {
+  return {
+    files: Array.isArray(result?.files) ? result.files : [],
+    contracts: Array.isArray(result?.contracts) ? result.contracts : [],
+    warnings: Array.isArray(result?.warnings) ? result.warnings : []
+  };
+}
+
+function mergeGenerationRepair(candidate, repair, batch) {
+  const normalizedRepair = normalizeGenerationResult(repair);
+  const targetSet = new Set((batch.files || []).map(normalizeProjectPath));
+  const map = new Map((candidate.files || []).map((file) => [normalizeProjectPath(file.path), file]));
+  for (const file of normalizedRepair.files || []) {
+    const filePath = normalizeProjectPath(file.path);
+    if (targetSet.has(filePath) || map.has(filePath)) map.set(filePath, { ...file, path: filePath });
+  }
+  return {
+    files: Array.from(map.values()),
+    contracts: [...(candidate.contracts || []), ...(normalizedRepair.contracts || [])],
+    warnings: [...(candidate.warnings || []), ...(normalizedRepair.warnings || [])]
+  };
+}
+
+function buildRepairFallback({ fallback, candidate, batch }) {
+  const targetSet = new Set((batch.files || []).map(normalizeProjectPath));
+  const map = new Map((candidate.files || []).map((file) => [normalizeProjectPath(file.path), file]));
+  for (const file of fallback.files || []) {
+    const filePath = normalizeProjectPath(file.path);
+    if (targetSet.has(filePath) && !map.has(filePath)) map.set(filePath, file);
+  }
+  return {
+    files: Array.from(map.values()).filter((file) => targetSet.has(normalizeProjectPath(file.path))),
+    contracts: fallback.contracts || [],
+    warnings: ['Repair fallback supplied missing target files for offline/mock mode.']
+  };
+}
+
+async function runGenerationBatch({ project, batch, batchIndex, totalBatches, previousFiles, contracts, warnings, skipSave = false }) {
+  if (!skipSave) {
+    project.generationStatus = 'generating_batch';
+    project.currentBatch = batch.batchNumber;
+    project.generationProgress = Math.max(5, Math.round((batchIndex / totalBatches) * 80));
+    await project.save();
+  }
+
+  const knownPitfalls = await retrieveVerifiedFixes({
+    category: batch.phase || 'code_generation',
+    technologies: ['React', 'Vite', 'JavaScript'],
+    message: [project.expandedSpec?.projectSummary, batch.agentName, batch.phase, batch.files.join(' ')].filter(Boolean).join(' '),
+    file: batch.files[0]
+  });
+  const fallback = mockGenerateBatch({ project, targetFiles: batch.files, batch });
+  const generated = await runCodeGenerationGraph({
+    specification: project.expandedSpec,
+    blueprint: project.blueprint,
+    previousFiles,
+    targetFiles: batch.files,
+    contracts,
+    warnings,
+    fallback,
+    agentName: batch.agentName,
+    phase: batch.phase,
+    dependencyContext: {
+      manager: 'Frontend Manager Agent',
+      agentName: batch.agentName,
+      phase: batch.phase,
+      dependsOn: batch.dependsOn || [],
+      concurrentGroup: batch.concurrentGroup || null,
+      targetFiles: batch.files,
+      knownPitfalls: buildKnownPitfallsPrompt(knownPitfalls)
+    }
+  });
+  return batch.concurrentGroup ? { batch, generated } : generated;
 }
 
 export function upsertGeneratedFiles(existingFiles, newFiles) {
@@ -110,7 +292,7 @@ export function upsertGeneratedFiles(existingFiles, newFiles) {
   return Array.from(map.values()).sort((a, b) => a.path.localeCompare(b.path));
 }
 
-function mockGenerateBatch({ project, targetFiles }) {
+function mockGenerateBatch({ project, targetFiles, batch }) {
   const spec = project.expandedSpec || {};
   const blueprint = project.blueprint || {};
   const files = targetFiles.map((filePath) => ({
@@ -118,7 +300,7 @@ function mockGenerateBatch({ project, targetFiles }) {
     language: languageForPath(filePath),
     content: contentForPath(filePath, spec, blueprint)
   }));
-  return { files, contracts: [], warnings: [] };
+  return { files, contracts: batch ? [{ agentName: batch.agentName, phase: batch.phase, files: targetFiles }] : [], warnings: [] };
 }
 
 function contentForPath(filePath, spec, blueprint) {

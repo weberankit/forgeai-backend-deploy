@@ -4,13 +4,15 @@ import { routeChatIntent } from './intentRouter.js';
 import { createSnapshot, applyFileChanges } from '../review/versioningService.js';
 import { runStaticValidation } from '../review/staticValidation.js';
 import { runFixLoop } from '../review/fixAgent.js';
+import { runEditGraph } from '../ai/langGraphAgent.js';
+import { buildKnownPitfallsPrompt, retrieveVerifiedFixes } from '../memory/verifiedFixMemory.js';
 
 export async function applyNaturalLanguageEdit(project, message) {
   const intent = routeChatIntent(message);
   if (intent !== 'edit') return { status: 'unknown', clarification: 'Tell me what generated UI change you want to make.' };
   const targeting = resolveEditTargets(project, message);
   if (targeting.needsClarification) return { status: 'needs_clarification', clarification: 'Which file or section should I update?', targets: targeting.targets };
-  const changes = produceEditChanges(project, message, targeting.targets);
+  const changes = await produceEditChanges(project, message, targeting.targets);
   if (!changes.length) return { status: 'needs_clarification', clarification: 'I could not identify a safe minimal edit for that request.', targets: targeting.targets };
   createSnapshot(project, 'edit', message);
   applyFileChanges(project, changes, 'edit', randomUUID());
@@ -24,7 +26,37 @@ export async function applyNaturalLanguageEdit(project, message) {
   return { status: project.operationStatus, changes, targets: targeting.targets, validation };
 }
 
-function produceEditChanges(project, message, targets) {
+async function produceEditChanges(project, message, targets) {
+  const targetFiles = (project.generatedFiles || [])
+    .filter((file) => targets.includes(file.path))
+    .map((file) => ({ path: file.path, language: file.language, content: file.content }));
+  const fallbackChanges = produceDeterministicEditChanges(project, message, targets);
+  const graph = project.dependencyGraph || {};
+  const knownPitfalls = await retrieveVerifiedFixes({
+    category: 'edit',
+    technologies: ['React', 'Vite', 'JavaScript'],
+    message,
+    file: targets[0]
+  });
+  const dependencyContext = {
+    targetGraph: Object.fromEntries(targets.map((target) => [target, graph[target] || {}])),
+    knownPitfalls: buildKnownPitfallsPrompt(knownPitfalls)
+  };
+  const result = await runEditGraph({
+    project: { name: project.name, expandedSpec: project.expandedSpec, blueprint: project.blueprint },
+    message,
+    targetFiles,
+    dependencyContext,
+    fallback: { changes: fallbackChanges, warnings: [] }
+  }).catch(() => ({ changes: fallbackChanges, warnings: ['LLM edit failed; deterministic fallback used.'] }));
+  const allowedTargets = new Set(targets);
+  return (result.changes || [])
+    .filter((change) => allowedTargets.has(change.path))
+    .map((change) => ({ path: change.path, changeType: 'update', content: change.content, reason: change.reason || 'Applied requested edit: ' + message, addressesFindingIds: [] }))
+    .slice(0, 8);
+}
+
+function produceDeterministicEditChanges(project, message, targets) {
   const text = String(message || '').toLowerCase();
   const changes = [];
   for (const file of project.generatedFiles || []) {
@@ -41,6 +73,7 @@ function produceEditChanges(project, message, targets) {
   }
   return changes.slice(0, 8);
 }
+
 function makeDarker(content) { return String(content).replace(/bg-slate-950/g, 'bg-black').replace(/bg-slate-100/g, 'bg-slate-950').replace(/text-slate-950/g, 'text-slate-50').replace(/bg-white/g, 'bg-slate-900').replace(/border-slate-200/g, 'border-slate-800').replace(/text-slate-500/g, 'text-slate-400'); }
 function replaceButtonText(content, message) { const match = String(message).match(/(?:text|to)\s+["']([^"']+)["']/i); const label = match?.[1] || 'Get Started'; return String(content).replace(/>(Submit|Save|Start|Get Started|Return home)</g, '>' + label + '<'); }
 function addPricingCards(content) {

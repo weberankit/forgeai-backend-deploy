@@ -1,7 +1,7 @@
 import path from 'path';
 import { httpError } from '../../utils/httpError.js';
 import { assertUniquePaths, normalizeProjectPath } from './pathSafety.js';
-import { validatePackageJson } from './packageSafety.js';
+import { sanitizePackageJson, validatePackageJson } from './packageSafety.js';
 
 const requiredFiles = ['package.json', 'index.html', 'src/main.jsx', 'src/App.jsx'];
 const blockedPathPatterns = [/^server\//i, /^api\//i, /Dockerfile/i, /docker-compose/i, /auth/i, /jwt/i, /oauth/i, /mongoose/i, /mongodb/i, /express/i];
@@ -36,11 +36,11 @@ export function mergeFiles(existingFiles, newFiles) {
 function normalizeAndValidateFileBasics(files) {
   if (!Array.isArray(files) || files.length === 0) throw httpError(400, 'No generated files returned.');
   if (files.length > 80) throw httpError(400, 'Generated project exceeds file count limit.');
-  const normalized = files.map((file) => ({
-    ...file,
-    path: normalizeProjectPath(file.path),
-    content: String(file.content || '')
-  }));
+  const normalized = files.map((file) => {
+    const normalizedPath = normalizeProjectPath(file.path);
+    const content = normalizedPath === 'package.json' ? sanitizePackageJson(String(file.content || '')) : String(file.content || '');
+    return { ...file, path: normalizedPath, content };
+  });
   assertUniquePaths(normalized);
   for (const file of normalized) {
     if (file.content.length > 180000) throw httpError(400, 'Generated file exceeds size limit: ' + file.path);

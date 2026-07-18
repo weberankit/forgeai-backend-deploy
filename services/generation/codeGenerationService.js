@@ -66,6 +66,7 @@ export async function generateProjectFiles(project, options = {}) {
           project.generationWarnings = [...new Set(warnings)];
           project.generationProgress = Math.max(project.generationProgress, Math.round((completedBatches / activeBatches.length) * 85));
           await project.save();
+          await options.onFiles?.(repairedGenerated.files, project);
         }
       } else {
         for (const batch of stage.batches) {
@@ -88,6 +89,7 @@ export async function generateProjectFiles(project, options = {}) {
           project.generationWarnings = [...new Set(warnings)];
           project.generationProgress = Math.max(project.generationProgress, Math.round((completedBatches / activeBatches.length) * 85));
           await project.save();
+          await options.onFiles?.(repairedGenerated.files, project);
         }
       }
     }

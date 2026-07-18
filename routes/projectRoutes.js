@@ -7,6 +7,7 @@ import {
   explainProject,
   fixProject,
   generateProject,
+  generateProjectStream,
   getDependencyGraph,
   getDeploymentStatus,
   getProject,
@@ -37,6 +38,7 @@ router.get('/:projectId', getProject);
 router.get('/:projectId/files', getProjectFiles);
 router.patch('/:projectId/files', updateProjectFiles);
 router.post('/:projectId/generate', generateProject);
+router.post('/:projectId/generate/stream', generateProjectStream);
 router.post('/:projectId/regenerate', regenerateProject);
 router.post('/:projectId/review', reviewProject);
 router.post('/:projectId/fix', fixProject);

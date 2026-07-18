@@ -3,6 +3,10 @@ import { applyFileChanges, createSnapshot } from './versioningService.js';
 import { runQualityReview } from './reviewAgent.js';
 import { runStaticValidation } from './staticValidation.js';
 import { storeVerifiedFixCandidate } from '../memory/verifiedFixMemory.js';
+import { runGenerationRepairGraph } from '../ai/langGraphAgent.js';
+import { repairMissingRelativeImports } from '../generation/importRepair.js';
+import { languageForPath, normalizeProjectPath } from '../generation/pathSafety.js';
+import path from 'path';
 
 export async function runFixLoop(project, { runtimeOutput = '', maxAttempts = 3 } = {}) {
   const runs = [];
@@ -27,7 +31,7 @@ export async function runFixLoop(project, { runtimeOutput = '', maxAttempts = 3 
       await project.save();
       return { status: 'passed', review, attempts: runs };
     }
-    const fixResult = produceFixes(project, review, attempt);
+    const fixResult = await produceFixes(project, review, attempt);
     if (!fixResult.changes.length) {
       review.status = 'escalated';
       project.operationStatus = 'human_escalation';
@@ -51,7 +55,9 @@ export async function runFixLoop(project, { runtimeOutput = '', maxAttempts = 3 
   return { status: 'escalated', attempts: runs };
 }
 
-export function produceFixes(project, review, attempt = 1) {
+export async function produceFixes(project, review, attempt = 1) {
+  const llmFix = await produceDynamicLlmFixes(project, review, attempt).catch(() => null);
+  if (llmFix?.changes?.length) return llmFix;
   const changes = [];
   const files = project.generatedFiles || [];
   const byPath = new Map(files.map((file) => [file.path, file]));
@@ -68,6 +74,47 @@ export function produceFixes(project, review, attempt = 1) {
     }
   }
   return { changes: dedupe(changes), verificationSteps: ['Run static validation', 'Refresh preview'], resolvedFindingIds: changes.flatMap((change) => change.addressesFindingIds), unresolvedIssues: [], requiresFullReview: true };
+}
+
+async function produceDynamicLlmFixes(project, review, attempt) {
+  const blocking = (review.findings || []).filter((finding) => ['blocker', 'high'].includes(finding.severity));
+  if (!blocking.length) return null;
+  const files = project.generatedFiles || [];
+  const validation = runStaticValidation(files);
+  const targetPaths = new Set(blocking.map((finding) => finding.file).filter(Boolean));
+  for (const error of validation.errors.filter((item) => item.code === 'missing_relative_import')) {
+    targetPaths.add(error.file);
+    const specifier = error.message.replace(/^Missing relative import:\s*/, '');
+    const base = normalizeProjectPath(path.posix.join(path.posix.dirname(error.file), specifier));
+    targetPaths.add(/\.(js|jsx)$/.test(base) ? base : base + (/\/hooks\//.test(base) ? '.js' : '.jsx'));
+  }
+  const targets = [...targetPaths];
+  if (!targets.length) return null;
+  const current = new Map(files.map((file) => [normalizeProjectPath(file.path), file]));
+  const result = await runGenerationRepairGraph({
+    specification: project.expandedSpec,
+    blueprint: project.blueprint,
+    previousFiles: files.filter((file) => !targets.includes(normalizeProjectPath(file.path))),
+    targetFiles: targets,
+    generatedFiles: targets.map((filePath) => current.get(filePath)).filter(Boolean),
+    validationError: validation.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '),
+    contracts: [],
+    warnings: project.generationWarnings || [],
+    fallback: { files: repairMissingRelativeImports(files).filter((file) => targets.includes(normalizeProjectPath(file.path))), contracts: [], warnings: [] },
+    agentName: 'Dynamic Preview Repair Agent',
+    phase: 'runtime_and_import_repair',
+    dependencyContext: { findings: blocking, dependencyGraph: validation.graph, instruction: 'Create missing modules and correct imports/exports. Never delete a required feature import merely to pass validation.' },
+    attempt
+  });
+  const changes = (result?.files || []).filter((file) => targets.includes(normalizeProjectPath(file.path))).map((file) => ({
+    path: normalizeProjectPath(file.path),
+    changeType: current.has(normalizeProjectPath(file.path)) ? 'update' : 'create',
+    content: String(file.content || ''),
+    language: file.language || languageForPath(file.path),
+    reason: 'Dynamic LLM repair attempt ' + attempt + ': ' + validation.errors.map((item) => item.message).join('; '),
+    addressesFindingIds: blocking.map((finding) => finding.id)
+  }));
+  return { changes: dedupe(changes), verificationSteps: ['Run static validation', 'Refresh WebContainer preview'], resolvedFindingIds: blocking.map((finding) => finding.id), unresolvedIssues: [], requiresFullReview: true };
 }
 
 function safeModuleContent(filePath) {

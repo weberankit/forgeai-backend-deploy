@@ -276,6 +276,30 @@ export async function generateProject(req, res, next) {
   }
 }
 
+export async function generateProjectStream(req, res) {
+  startSse(res);
+  try {
+    const project = await findVisitorProject(req.params.projectId, req.visitorId);
+    if (project.approvalStatus !== 'approved') throw httpError(409, 'Blueprint must be approved before generation.');
+    const generated = await generateProjectFiles(project, {
+      onFiles: async (files, current) => writeSse(res, 'files', {
+        files,
+        generationStatus: current.generationStatus,
+        generationProgress: current.generationProgress,
+        currentBatch: current.currentBatch
+      })
+    });
+    const chat = await findVisitorChat(generated.chatId, req.visitorId);
+    chat.messages.push({ messageId: randomUUID(), role: 'assistant', type: 'status', content: 'Generated project files are ready for live preview.', metadata: { projectId: generated.projectId, fileCount: generated.generatedFiles.length } });
+    await chat.save();
+    writeSse(res, 'final', { project: serializeProject(generated), files: generated.generatedFiles, generationPlan: getGenerationPlan(generated.blueprint || {}) });
+    res.end();
+  } catch (error) {
+    writeSse(res, 'error', { message: error.message });
+    res.end();
+  }
+}
+
 export async function updateProjectFiles(req, res, next) {
   try {
     const project = await findVisitorProject(req.params.projectId, req.visitorId);

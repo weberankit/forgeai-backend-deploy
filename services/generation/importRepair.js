@@ -37,7 +37,7 @@ function resolveCandidate(base, byPath) {
 function buildRepairFile(base, byPath) {
   const filePath = preferredRepairPath(base);
   const target = findBestTarget(base, byPath);
-  const content = target ? bridgeContent(filePath, target.path) : fallbackComponentContent(componentNameFromPath(base));
+  const content = target ? bridgeContent(filePath, target.path) : fallbackModuleContent(filePath, componentNameFromPath(base));
   return {
     path: filePath,
     language: languageForPath(filePath),
@@ -74,6 +74,15 @@ function findBestTarget(base, byPath) {
 function bridgeContent(filePath, targetPath) {
   const relative = relativeImport(filePath, targetPath);
   return "export { default } from '" + relative + "';\nexport * from '" + relative + "';\n";
+}
+
+function fallbackModuleContent(filePath, componentName) {
+  if (filePath.includes('/hooks/')) {
+    const hookName = /^Use[A-Z]/.test(componentName) ? componentName[0].toLowerCase() + componentName.slice(1) : (/^use[A-Z]/.test(componentName) ? componentName : 'use' + componentName);
+    return 'export function ' + hookName + "() {\n  const toggle = () => {};\n  return { value: false, isDarkMode: false, darkMode: false, toggle, toggleDarkMode: toggle };\n}\nexport default " + hookName + ';\n';
+  }
+  if (filePath.endsWith('.js')) return 'export const ' + componentName + ' = {};\nexport default ' + componentName + ';\n';
+  return fallbackComponentContent(componentName);
 }
 
 function fallbackComponentContent(componentName) {

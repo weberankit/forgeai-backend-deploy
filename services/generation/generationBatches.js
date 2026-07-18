@@ -62,7 +62,7 @@ function uniquePush(paths, filePath) {
 function classify(filePath) {
   if (setupFiles.includes(filePath)) return 1;
   if (stylingFiles.includes(filePath) || /^src\/(styles|theme|tokens)\//.test(filePath) || /\.(css)$/.test(filePath)) return 5;
-  if (/^src\/(components|data|utils|services|store|features)\//.test(filePath)) return 2;
+  if (/^src\/(components|data|hooks|utils|services|store|features)\//.test(filePath)) return 2;
   if (/^src\/(layouts|routes|navigation)\//.test(filePath)) return 3;
   if (/^src\/pages\//.test(filePath)) return 4;
   if (requiredIntegrationFiles.includes(filePath) || filePath === 'src/app/App.jsx') return 6;

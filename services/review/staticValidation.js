@@ -2,6 +2,8 @@ import * as parser from '@babel/parser';
 import { validatePackageJson } from '../generation/packageSafety.js';
 import { normalizeProjectPath } from '../generation/pathSafety.js';
 import { buildDependencyGraph, findCircularImports } from './dependencyGraph.js';
+import { validateProjectSymbols } from './symbolValidation.js';
+import { validateRouteIntegration } from './routeValidation.js';
 
 const requiredFiles = ['package.json', 'index.html', 'src/main.jsx', 'src/App.jsx'];
 const blockedPatterns = [/^server\//i, /^api\//i, /Dockerfile/i, /docker-compose/i, /auth/i, /jwt/i, /oauth/i, /mongoose/i, /mongodb/i, /express/i];
@@ -46,7 +48,16 @@ export function runStaticValidation(files = []) {
     }
   }
 
-  return { passed: errors.length === 0, errors, warnings, graph };
+  const symbolValidation = validateProjectSymbols(normalized);
+  const existing = new Set(errors.map((item) => [item.code, item.file, item.line, item.symbol].join(':')));
+  for (const finding of symbolValidation.errors) {
+    const key = [finding.code, finding.file, finding.line, finding.symbol].join(':');
+    if (!existing.has(key)) errors.push(finding);
+  }
+  const routeValidation = validateRouteIntegration(normalized);
+  errors.push(...routeValidation.errors);
+
+  return { passed: errors.length === 0, errors, warnings, graph, symbols: symbolValidation.tables, routeValidation };
 }
 
 function issue(code, message, file) {

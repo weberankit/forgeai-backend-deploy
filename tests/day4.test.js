@@ -154,7 +154,8 @@ test('keeps supported frontend packages and removes unsupported package dependen
         dependencies: {
           react: '^18.3.1',
           '@stripe/react-stripe-js': '^2.8.0',
-          'bad-sdk': '^1.0.0'
+          'react-beautiful-dnd': '^13.1.1',
+          express: '^4.21.0'
         }
       })
     }
@@ -162,8 +163,9 @@ test('keeps supported frontend packages and removes unsupported package dependen
   const pkg = JSON.parse(files[0].content);
   assert.equal(pkg.dependencies.react, '^18.3.1');
   assert.equal(pkg.dependencies['@stripe/react-stripe-js'], '^2.8.0');
-  assert.equal(pkg.dependencies['bad-sdk'], undefined);
-  assert.deepEqual(pkg.aiFrontendEngineer.removedUnsupportedDependencies, ['bad-sdk']);
+  assert.equal(pkg.dependencies['react-beautiful-dnd'], '^13.1.1');
+  assert.equal(pkg.dependencies.express, undefined);
+  assert.deepEqual(pkg.aiFrontendEngineer.removedUnsupportedDependencies, ['express']);
 });
 
 

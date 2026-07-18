@@ -23,15 +23,21 @@ export function buildCodeGenerationPrompt({ specification, blueprint, previousFi
     '- Lucide React',
     '- localStorage',
     '- Mock data',
+    '- Safe browser-compatible npm packages when they materially implement the requested UI behavior',
     '- Frontend-only mock flows for payments, auth, uploads, email, maps, analytics, or third-party integrations unless the package is already in the allowed stack',
     '',
     'Disallowed: Express, MongoDB, Mongoose, SQL, authentication, JWT, OAuth, Docker, Next.js, server routes, server-only secrets.',
-    'Do not import random external SDKs for requested product features. For example, if the user asks for Stripe/payment UI, build a frontend mock checkout flow with local state and mock data unless the requested target file is package.json and the dependency is explicitly supported.',
+    'You may add a browser-compatible npm dependency when it is needed for the requested UI. Add it to package.json and import it normally. Never add server frameworks, databases, server auth packages, lifecycle scripts, Git/URL dependencies, or packages that require secrets.',
     '',
     'Return this exact JSON shape:',
     '{ "files": [{ "path": "src/components/Header.jsx", "language": "jsx", "content": "complete file content" }], "contracts": [], "warnings": [] }',
     '',
     'Generate only the requested target files. Preserve exact paths. Return complete working file contents. Do not use placeholder comments or TODO-only code. Ensure imports refer to generated or existing files.',
+    'Return exactly one complete version of each target file. Never duplicate imports, declarations, exports, routes, or file paths.',
+    'Implement the specification and blueprint literally: requested sections, workflows, interactions, data, and design direction must appear in the UI.',
+    'Use the supplied previous file contents as authoritative contracts. Do not invent exports, prop names, aliases, or alternate folders.',
+    'Only src/App.jsx integrates routes and only src/main.jsx mounts React. Do not create another router or application entry.',
+    'Before returning, verify every rendered component is imported or declared and every imported symbol is exported by its real module.',
     'Never import a relative module unless that exact file exists in previous files, target files, or the blueprint file list. If you import ./routes/AppRoutes, then src/routes/AppRoutes.jsx must be generated or already present.',
     'Respect dependency order: consume previous files/contracts, but do not redefine upstream responsibilities unless a requested target file requires it.',
     '',
@@ -42,7 +48,7 @@ export function buildCodeGenerationPrompt({ specification, blueprint, previousFi
     JSON.stringify(blueprint, null, 2),
     '',
     'Previously generated files:',
-    JSON.stringify(previousFiles?.map((file) => ({ path: file.path, language: file.language })), null, 2),
+    JSON.stringify(buildPreviousFileContext(previousFiles), null, 2),
     '',
     'Target files:',
     JSON.stringify(targetFiles, null, 2),
@@ -59,4 +65,15 @@ export function buildCodeGenerationPrompt({ specification, blueprint, previousFi
     'Previous warnings:',
     JSON.stringify(warnings || [], null, 2)
   ].join('\n');
+}
+
+
+function buildPreviousFileContext(files = []) {
+  let remaining = 90000;
+  return files.map((file) => {
+    const content = String(file.content || '');
+    const included = content.slice(0, Math.max(0, Math.min(content.length, remaining)));
+    remaining -= included.length;
+    return { path: file.path, language: file.language, content: included, truncated: included.length < content.length };
+  });
 }

@@ -7,6 +7,8 @@ import { runFixLoop } from '../review/fixAgent.js';
 import { runStaticValidation } from '../review/staticValidation.js';
 import { repairMissingRelativeImports } from './importRepair.js';
 import { buildKnownPitfallsPrompt, retrieveVerifiedFixes } from '../memory/verifiedFixMemory.js';
+import { runDeterministicRepairs } from './deterministicRepair.js';
+import { assertDisjointWriteSets, assertOwnedBatchFiles, buildProjectManifest, manifestForBatch } from './projectManifest.js';
 
 export function getGenerationPlan(blueprint) {
   return buildGenerationBatches(blueprint);
@@ -14,12 +16,15 @@ export function getGenerationPlan(blueprint) {
 
 export async function generateProjectFiles(project, options = {}) {
   const batches = buildGenerationBatches(project.blueprint || {});
+  const manifest = buildProjectManifest(project.blueprint || {}, batches);
+  project.generationManifest = manifest;
   const selectedSet = Array.isArray(options.selectedFiles) && options.selectedFiles.length
     ? new Set(options.selectedFiles.map(normalizeProjectPath))
     : null;
   const contracts = [];
   const warnings = [...(project.generationWarnings || [])];
   let existingFiles = project.generatedFiles || [];
+  let lastValidProjectFiles = [...existingFiles];
 
   project.generationStatus = 'preparing';
   project.currentBatch = 0;
@@ -38,6 +43,7 @@ export async function generateProjectFiles(project, options = {}) {
     const stages = buildAgentExecutionStages(activeBatches);
     for (const stage of stages) {
       if (stage.parallel) {
+        assertDisjointWriteSets(stage.batches);
         const stagePreviousFiles = existingFiles;
         const stageContracts = [...contracts];
         const stageWarnings = [...warnings];
@@ -53,15 +59,23 @@ export async function generateProjectFiles(project, options = {}) {
           previousFiles: stagePreviousFiles,
           contracts: stageContracts,
           warnings: stageWarnings,
+          manifest,
           skipSave: true
         })));
         for (const { batch, generated } of results) {
           const repairedGenerated = await repairGenerationBatch({ project, batch, generated, previousFiles: existingFiles, contracts, warnings });
           for (const warning of repairedGenerated.warnings || []) warnings.push(warning);
           for (const contract of repairedGenerated.contracts || []) contracts.push(contract);
-          existingFiles = repairMissingRelativeImports(mergeFiles(existingFiles, repairedGenerated.files));
-          project.generatedFiles = repairMissingRelativeImports(upsertGeneratedFiles(project.generatedFiles || [], repairedGenerated.files));
-          project.dependencyGraph = runStaticValidation(project.generatedFiles || []).graph;
+          const proposedFiles = repairMissingRelativeImports(upsertGeneratedFiles(project.generatedFiles || [], repairedGenerated.files));
+          const proposedValidation = runStaticValidation(proposedFiles);
+          const changedPaths = new Set(repairedGenerated.files.map((file) => normalizeProjectPath(file.path)));
+          const blockingErrors = proposedValidation.errors.filter((error) => !error.file || changedPaths.has(error.file));
+          if (blockingErrors.length) throw new Error(blockingErrors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
+          project.generatedFiles = proposedFiles;
+          existingFiles = proposedFiles;
+          project.dependencyGraph = proposedValidation.graph;
+          lastValidProjectFiles = [...proposedFiles];
+          project.lastValidProjectFiles = lastValidProjectFiles;
           completedBatches += 1;
           project.generationWarnings = [...new Set(warnings)];
           project.generationProgress = Math.max(project.generationProgress, Math.round((completedBatches / activeBatches.length) * 85));
@@ -77,14 +91,22 @@ export async function generateProjectFiles(project, options = {}) {
             totalBatches: activeBatches.length,
             previousFiles: existingFiles,
             contracts,
-            warnings
+            warnings,
+            manifest
           });
           const repairedGenerated = await repairGenerationBatch({ project, batch, generated, previousFiles: existingFiles, contracts, warnings });
           for (const warning of repairedGenerated.warnings || []) warnings.push(warning);
           for (const contract of repairedGenerated.contracts || []) contracts.push(contract);
-          existingFiles = repairMissingRelativeImports(mergeFiles(existingFiles, repairedGenerated.files));
-          project.generatedFiles = repairMissingRelativeImports(upsertGeneratedFiles(project.generatedFiles || [], repairedGenerated.files));
-          project.dependencyGraph = runStaticValidation(project.generatedFiles || []).graph;
+          const proposedFiles = repairMissingRelativeImports(upsertGeneratedFiles(project.generatedFiles || [], repairedGenerated.files));
+          const proposedValidation = runStaticValidation(proposedFiles);
+          const changedPaths = new Set(repairedGenerated.files.map((file) => normalizeProjectPath(file.path)));
+          const blockingErrors = proposedValidation.errors.filter((error) => !error.file || changedPaths.has(error.file));
+          if (blockingErrors.length) throw new Error(blockingErrors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
+          project.generatedFiles = proposedFiles;
+          existingFiles = proposedFiles;
+          project.dependencyGraph = proposedValidation.graph;
+          lastValidProjectFiles = [...proposedFiles];
+          project.lastValidProjectFiles = lastValidProjectFiles;
           completedBatches += 1;
           project.generationWarnings = [...new Set(warnings)];
           project.generationProgress = Math.max(project.generationProgress, Math.round((completedBatches / activeBatches.length) * 85));
@@ -126,6 +148,9 @@ export async function generateProjectFiles(project, options = {}) {
     await project.save();
     return project;
   } catch (error) {
+    project.generatedFiles = lastValidProjectFiles;
+    project.lastValidProjectFiles = lastValidProjectFiles;
+    project.dependencyGraph = runStaticValidation(lastValidProjectFiles).graph;
     project.generationStatus = 'failed';
     project.failedBatch = project.currentBatch || null;
     project.generationError = error.message;
@@ -141,6 +166,13 @@ export async function repairGenerationBatch({ project, batch, generated, previou
   let lastError = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const deterministic = runDeterministicRepairs(previousFiles, candidate.files);
+    candidate.files = deterministic.files;
+    const previousPaths = new Set((previousFiles || []).map((file) => normalizeProjectPath(file.path)));
+    const candidatePaths = new Set(candidate.files.map((file) => normalizeProjectPath(file.path)));
+    const importRepaired = repairMissingRelativeImports(mergeFiles(previousFiles || [], candidate.files));
+    candidate.files = importRepaired.filter((file) => candidatePaths.has(normalizeProjectPath(file.path)) || !previousPaths.has(normalizeProjectPath(file.path)));
+    if (deterministic.repairs.length) candidate.warnings = [...(candidate.warnings || []), ...deterministic.repairs.map((item) => 'Deterministic repair: ' + item.file + ' - ' + item.action)];
     try {
       validateGenerationBatch(candidate.files, batch.files, previousFiles);
       validateBatchGraph(candidate.files, previousFiles);
@@ -228,7 +260,7 @@ function buildRepairFallback({ fallback, candidate, batch }) {
   };
 }
 
-async function runGenerationBatch({ project, batch, batchIndex, totalBatches, previousFiles, contracts, warnings, skipSave = false }) {
+async function runGenerationBatch({ project, batch, batchIndex, totalBatches, previousFiles, contracts, warnings, manifest, skipSave = false }) {
   if (!skipSave) {
     project.generationStatus = 'generating_batch';
     project.currentBatch = batch.batchNumber;
@@ -260,9 +292,16 @@ async function runGenerationBatch({ project, batch, batchIndex, totalBatches, pr
       dependsOn: batch.dependsOn || [],
       concurrentGroup: batch.concurrentGroup || null,
       targetFiles: batch.files,
-      knownPitfalls: buildKnownPitfallsPrompt(knownPitfalls)
+      knownPitfalls: buildKnownPitfallsPrompt(knownPitfalls),
+      manifest: manifestForBatch(manifest, batch)
     }
   });
+  const assigned = new Set(batch.files.map(normalizeProjectPath));
+  const returnedFiles = Array.isArray(generated.files) ? generated.files : [];
+  const rejectedPaths = returnedFiles.map((file) => normalizeProjectPath(file.path)).filter((filePath) => !assigned.has(filePath));
+  generated.files = returnedFiles.filter((file) => assigned.has(normalizeProjectPath(file.path)));
+  if (rejectedPaths.length) generated.warnings = [...(generated.warnings || []), 'Ignored files outside this agent ownership: ' + rejectedPaths.join(', ')];
+  assertOwnedBatchFiles(generated.files, batch, manifest);
   return batch.concurrentGroup ? { batch, generated } : generated;
 }
 
@@ -306,7 +345,7 @@ function mockGenerateBatch({ project, targetFiles, batch }) {
 }
 
 function contentForPath(filePath, spec, blueprint) {
-  if (filePath === 'package.json') return packageJson();
+  if (filePath === 'package.json') return packageJson(blueprint);
   if (filePath === 'index.html') return indexHtml(spec);
   if (filePath === 'vite.config.js') return viteConfig();
   if (filePath === 'tailwind.config.js') return tailwindConfig();
@@ -328,22 +367,16 @@ function contentForPath(filePath, spec, blueprint) {
   return genericJs(filePath);
 }
 
-function packageJson() {
-  return JSON.stringify({
-    scripts: { dev: 'vite', build: 'vite build', preview: 'vite preview --host 0.0.0.0' },
-    dependencies: {
-      '@vitejs/plugin-react': '^4.3.1',
-      vite: '^5.4.2',
-      react: '^18.3.1',
-      'react-dom': '^18.3.1',
-      'react-router-dom': '^6.26.1',
-      'lucide-react': '^0.468.0',
-      tailwindcss: '^3.4.10',
-      postcss: '^8.4.41',
-      autoprefixer: '^10.4.20'
-    },
-    devDependencies: {}
-  }, null, 2) + '\n';
+function packageJson(blueprint = {}) {
+  const versions = { '@vitejs/plugin-react': '^4.3.1', vite: '^5.4.2', react: '^18.3.1', 'react-dom': '^18.3.1', 'react-router-dom': '^6.26.1', 'lucide-react': '^0.468.0', tailwindcss: '^3.4.10', postcss: '^8.4.41', autoprefixer: '^10.4.20', '@reduxjs/toolkit': '^2.2.7', 'react-redux': '^9.1.2' };
+  const dependencies = {};
+  for (const entry of blueprint.requiredDependencies || Object.keys(versions)) {
+    const name = typeof entry === 'string' ? entry : entry?.name;
+    if (!name) continue;
+    dependencies[name] = (typeof entry === 'object' && entry.version) || versions[name] || 'latest';
+  }
+  for (const [name, version] of Object.entries(versions)) if (['react','react-dom','vite','@vitejs/plugin-react'].includes(name)) dependencies[name] ||= version;
+  return JSON.stringify({ scripts: { dev: 'vite', build: 'vite build', preview: 'vite preview --host 0.0.0.0' }, dependencies, devDependencies: {} }, null, 2) + '\n';
 }
 
 function indexHtml(spec) {

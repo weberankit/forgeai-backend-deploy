@@ -31,7 +31,7 @@ export function buildGenerationRepairPrompt({ specification, blueprint, previous
     JSON.stringify(generatedFiles || [], null, 2),
     '',
     'Previously generated files available to import:',
-    JSON.stringify((previousFiles || []).map((file) => ({ path: file.path, language: file.language })), null, 2),
+    JSON.stringify((previousFiles || []).map((file) => ({ path: file.path, language: file.language, content: String(file.content || '').slice(0, 30000) })), null, 2),
     '',
     'Registered contracts:',
     JSON.stringify(contracts || [], null, 2),

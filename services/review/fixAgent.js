@@ -38,16 +38,21 @@ export async function runFixLoop(project, { runtimeOutput = '', maxAttempts = 3 
       await project.save();
       return { status: 'escalated', review, attempts: runs, fixResult };
     }
+    const proposedFiles = applyChangesInMemory(project.generatedFiles || [], fixResult.changes);
+    const validation = runStaticValidation(proposedFiles);
+    review.fixChanges = fixResult.changes.map((change) => ({ path: change.path, reason: change.reason }));
+    if (!validation.passed) {
+      project.operationStatus = 'fix_validation_failed';
+      runtimeOutput = validation.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; ');
+      continue;
+    }
     createSnapshot(project, 'fix', 'Attempt ' + attempt + ' for findings ' + fixResult.resolvedFindingIds.join(', '));
     applyFileChanges(project, fixResult.changes, 'fix', randomUUID());
-    review.fixChanges = fixResult.changes.map((change) => ({ path: change.path, reason: change.reason }));
-    const validation = runStaticValidation(project.generatedFiles || []);
     project.dependencyGraph = validation.graph;
-    project.operationStatus = validation.passed ? 'fix_applied' : 'fix_validation_failed';
-    if (validation.passed) {
-      addVerifiedFix(project, fixResult, review);
-      pendingVerifiedFix = { review, changes: fixResult.changes, attempt };
-    }
+    project.operationStatus = 'fix_applied';
+    addVerifiedFix(project, fixResult, review);
+    pendingVerifiedFix = { review, changes: fixResult.changes, attempt };
+    runtimeOutput = '';
     await project.save();
   }
   project.operationStatus = 'human_escalation';
@@ -115,6 +120,15 @@ async function produceDynamicLlmFixes(project, review, attempt) {
     addressesFindingIds: blocking.map((finding) => finding.id)
   }));
   return { changes: dedupe(changes), verificationSteps: ['Run static validation', 'Refresh WebContainer preview'], resolvedFindingIds: blocking.map((finding) => finding.id), unresolvedIssues: [], requiresFullReview: true };
+}
+
+function applyChangesInMemory(files, changes) {
+  const map = new Map((files || []).map((file) => [normalizeProjectPath(file.path), { ...file }]));
+  for (const change of changes || []) {
+    const filePath = normalizeProjectPath(change.path);
+    map.set(filePath, { ...(map.get(filePath) || {}), path: filePath, language: change.language || languageForPath(filePath), content: String(change.content || '') });
+  }
+  return [...map.values()];
 }
 
 function safeModuleContent(filePath) {

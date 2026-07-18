@@ -263,7 +263,11 @@ async function callStructuredAgent({ operation, prompt, fallbackResult, validato
       console.warn('LangGraph structured agent output failed', { operation, attempt, message: error.message });
       attemptPrompt = prompt + '\n\nYour previous response was rejected: ' + error.message + '\nReturn only valid JSON matching the exact requested shape. Do not include Markdown fences or commentary.';
       if (attempt === 2) {
-        if ((operation === 'code_generation' || operation === 'generation_repair' || operation === 'edit' || operation === 'explain') && fallbackResult) return fallbackResult;
+        if (fallbackResult) {
+          console.warn('LangGraph agent exhausted retries; using validated local fallback', { operation, message: error.message });
+          const fallbackValidation = validator(fallbackResult);
+          if (fallbackValidation.valid) return fallbackResult;
+        }
         throw error;
       }
     }
@@ -274,18 +278,21 @@ async function callOpenAI(prompt, { onToken } = {}) {
   if (!process.env.OPENAI_API_KEY) {
     throw new Error('OPENAI_API_KEY is required when AI_PROVIDER=openai.');
   }
-  const response = await fetch('https://api.openai.com/v1/responses', {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Number(process.env.AI_REQUEST_TIMEOUT_MS || 90000));
+  let response;
+  try { response = await fetch('https://api.openai.com/v1/responses', {
     method: 'POST',
     headers: {
       Authorization: 'Bearer ' + process.env.OPENAI_API_KEY,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({
-      model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
-      input: prompt,
-      stream: Boolean(onToken)
-    })
-  });
+    body: JSON.stringify({ model: process.env.OPENAI_MODEL || 'gpt-4.1-mini', input: prompt, stream: Boolean(onToken), max_output_tokens: Number(process.env.OPENAI_MAX_OUTPUT_TOKENS || 16000) }),
+    signal: controller.signal
+  }); } catch (error) {
+    if (error.name === 'AbortError') throw new Error('AI request timed out after ' + Number(process.env.AI_REQUEST_TIMEOUT_MS || 90000) + 'ms.');
+    throw error;
+  } finally { clearTimeout(timeout); }
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
     throw new Error(data.error?.message || 'OpenAI request failed');

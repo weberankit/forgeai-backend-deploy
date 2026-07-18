@@ -2,6 +2,7 @@ import path from 'path';
 import { httpError } from '../../utils/httpError.js';
 import { assertUniquePaths, normalizeProjectPath } from './pathSafety.js';
 import { sanitizePackageJson, validatePackageJson } from './packageSafety.js';
+import { validateProjectSymbols } from '../review/symbolValidation.js';
 
 const requiredFiles = ['package.json', 'index.html', 'src/main.jsx', 'src/App.jsx'];
 const blockedPathPatterns = [/^server\//i, /^api\//i, /Dockerfile/i, /docker-compose/i, /auth/i, /jwt/i, /oauth/i, /mongoose/i, /mongodb/i, /express/i];
@@ -15,6 +16,7 @@ export function validateGeneratedFiles(files, targetFiles = []) {
   }
   assertTargetsReturned(pathSet, targetFiles);
   validateRelativeImports(normalized, pathSet);
+  assertSymbols(normalized);
   return normalized;
 }
 
@@ -22,7 +24,9 @@ export function validateGenerationBatch(files, targetFiles, existingFiles = []) 
   const normalized = normalizeAndValidateFileBasics(files);
   const pathSet = new Set(normalized.map((file) => file.path));
   assertTargetsReturned(pathSet, targetFiles);
-  normalizeAndValidateFileBasics(mergeFiles(existingFiles, files));
+  const combined = normalizeAndValidateFileBasics(mergeFiles(existingFiles, files));
+  validateRelativeImports(combined, new Set(combined.map((file) => file.path)));
+  assertSymbols(combined);
   return normalized;
 }
 
@@ -54,6 +58,15 @@ function normalizeAndValidateFileBasics(files) {
     if (file.path === 'package.json') validatePackageJson(file.content);
   }
   return normalized;
+}
+
+function assertSymbols(files) {
+  const validation = validateProjectSymbols(files);
+  if (validation.errors.length) {
+    const error = httpError(400, validation.errors.map((item) => (item.file ? item.file + (item.line ? ':' + item.line : '') + ': ' : '') + item.message).join('; '));
+    error.findings = validation.errors;
+    throw error;
+  }
 }
 
 function assertTargetsReturned(pathSet, targetFiles = []) {

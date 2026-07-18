@@ -8,12 +8,12 @@ import { runEditGraph } from '../ai/langGraphAgent.js';
 import { buildKnownPitfallsPrompt, retrieveVerifiedFixes } from '../memory/verifiedFixMemory.js';
 
 export async function applyNaturalLanguageEdit(project, message) {
-  const intent = routeChatIntent(message);
-  if (intent !== 'edit') return { status: 'unknown', clarification: 'Tell me what generated UI change you want to make.' };
+  const intent = await routeChatIntent(message);
+  if (intent !== 'edit') return saveClarification(project, 'Tell me what generated UI change you want to make.');
   const targeting = resolveEditTargets(project, message);
-  if (targeting.needsClarification) return { status: 'needs_clarification', clarification: 'Which file or section should I update?', targets: targeting.targets };
+  if (targeting.needsClarification) return saveClarification(project, 'Which file or section should I update?', targeting.targets);
   const changes = await produceEditChanges(project, message, targeting.targets);
-  if (!changes.length) return { status: 'needs_clarification', clarification: 'I could not identify a safe minimal edit for that request.', targets: targeting.targets };
+  if (!changes.length) return saveClarification(project, 'I could not produce a safe edit. Please describe the exact visual or behavior change you want.', targeting.targets);
   createSnapshot(project, 'edit', message);
   applyFileChanges(project, changes, 'edit', randomUUID());
   project.lastEditMessage = message;
@@ -89,3 +89,9 @@ function addProgressBar(content) {
   return String(content).replace('</div>\n  );', progress + '\n    </div>\n  );');
 }
 function addLocalStorageHint(content) { if (content.includes('localStorage')) return content; return String(content).replace('export default function', "const storageKey = 'generated-app-state';\nfunction saveState(value) { localStorage.setItem(storageKey, JSON.stringify(value)); }\n\nexport default function"); }
+
+async function saveClarification(project, clarification, targets = []) {
+  project.operationStatus = 'needs_clarification';
+  await project.save();
+  return { status: 'needs_clarification', clarification, targets };
+}

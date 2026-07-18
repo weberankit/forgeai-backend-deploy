@@ -253,13 +253,15 @@ async function codeGenerationNode(state) {
 
 async function callStructuredAgent({ operation, prompt, fallbackResult, validator, onToken }) {
   const provider = process.env.AI_PROVIDER || 'mock';
+  let attemptPrompt = prompt;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
-      const raw = provider === 'openai' ? await callOpenAI(prompt, { onToken }) : JSON.stringify(fallbackResult);
+      const raw = provider === 'openai' ? await callOpenAI(attemptPrompt, { onToken }) : JSON.stringify(fallbackResult);
       if (provider !== 'openai' && onToken) onToken(raw);
       return parseStructuredResponse(raw, validator);
     } catch (error) {
       console.warn('LangGraph structured agent output failed', { operation, attempt, message: error.message });
+      attemptPrompt = prompt + '\n\nYour previous response was rejected: ' + error.message + '\nReturn only valid JSON matching the exact requested shape. Do not include Markdown fences or commentary.';
       if (attempt === 2) {
         if ((operation === 'code_generation' || operation === 'generation_repair' || operation === 'edit' || operation === 'explain') && fallbackResult) return fallbackResult;
         throw error;

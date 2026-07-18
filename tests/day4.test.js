@@ -12,6 +12,7 @@ import { explainProjectQuestion } from '../services/explain/explainAgent.js';
 import { buildDependencyGraph } from '../services/review/dependencyGraph.js';
 import { repairMissingRelativeImports } from '../services/generation/importRepair.js';
 import { resolveEditTargets } from '../services/edit/editTargeting.js';
+import { routeChatIntent } from '../services/edit/intentRouter.js';
 import { appendVerifiedFixMemoryRecord, buildErrorSignature, buildKnownPitfallsPrompt, retrieveVerifiedFixes } from '../services/memory/verifiedFixMemory.js';
 
 test('rejects unsafe generated paths', () => {
@@ -289,6 +290,12 @@ test('explain agent changes response mode for flow and code requests', async () 
   assert.equal(flow.mode, 'flow');
   assert.equal(code.mode, 'code');
   assert.match(code.directAnswer, /code-level/);
+});
+
+test('classifies direct and conversational edit requests', async () => {
+  assert.equal(await routeChatIntent('edit the FAQ'), 'edit');
+  assert.equal(await routeChatIntent('Can you modify the FAQ accordion?'), 'edit');
+  assert.equal(await routeChatIntent('How does the FAQ work?'), 'explain');
 });
 
 test('applies graph-targeted natural language edits with fallback in mock mode', async () => {

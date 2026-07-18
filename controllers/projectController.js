@@ -11,6 +11,7 @@ import { runQualityReview } from '../services/review/reviewAgent.js';
 import { runFixLoop } from '../services/review/fixAgent.js';
 import { runStaticValidation } from '../services/review/staticValidation.js';
 import { applyNaturalLanguageEdit } from '../services/edit/editAgent.js';
+import { routeChatIntent } from '../services/edit/intentRouter.js';
 import { restoreLatestSnapshot } from '../services/review/versioningService.js';
 import { explainProjectQuestion } from '../services/explain/explainAgent.js';
 import { startDeployment, getDeployment } from '../services/deploy/deploymentService.js';
@@ -355,6 +356,16 @@ export async function fixProject(req, res, next) {
     await project.save();
     const result = await runFixLoop(project, { runtimeOutput: String(req.body.runtimeOutput || ''), maxAttempts: 3 });
     res.json({ project: serializeProject(project), result });
+  } catch (error) { next(error); }
+}
+
+export async function classifyProjectMessage(req, res, next) {
+  try {
+    await findVisitorProject(req.params.projectId, req.visitorId);
+    const message = String(req.body.message || '').trim();
+    if (!message) throw httpError(400, 'message is required.');
+    const intent = await routeChatIntent(message);
+    res.json({ intent });
   } catch (error) { next(error); }
 }
 

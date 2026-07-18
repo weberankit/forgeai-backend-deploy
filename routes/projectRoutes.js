@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import {
+  classifyProjectMessage,
   deployProject,
   editProject,
   expandProject,
@@ -42,6 +43,7 @@ router.post('/:projectId/generate/stream', generateProjectStream);
 router.post('/:projectId/regenerate', regenerateProject);
 router.post('/:projectId/review', reviewProject);
 router.post('/:projectId/fix', fixProject);
+router.post('/:projectId/intent', classifyProjectMessage);
 router.post('/:projectId/edit', editProject);
 router.post('/:projectId/explain', explainProject);
 router.post('/:projectId/deploy', deployProject);

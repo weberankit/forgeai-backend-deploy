@@ -17,7 +17,7 @@ export function validateRouteIntegration(files = []) {
         const name = jsxName(pathRef.node.name);
         if (name === 'Route') {
           const routePath = stringAttribute(pathRef.node.attributes, 'path');
-          if (routePath) routes.push({ path: routePath, file: file.path });
+          if (routePath && isAuthoritativeRouteFile(file.path)) routes.push({ path: routePath, file: file.path });
         }
         if (name === 'Link' || name === 'NavLink') {
           const to = stringAttribute(pathRef.node.attributes, 'to');
@@ -30,7 +30,7 @@ export function validateRouteIntegration(files = []) {
         const owner = pathRef.findParent((parent) => parent.isVariableDeclarator());
         const ownerName = owner?.node?.id?.name || '';
         if (/(nav|menu|navigation)/i.test(ownerName)) navigation.push({ path: pathRef.node.value.value, file: file.path });
-        if (/(route|router)/i.test(ownerName)) routes.push({ path: pathRef.node.value.value, file: file.path });
+        if (/(route|router)/i.test(ownerName) && isAuthoritativeRouteFile(file.path)) routes.push({ path: pathRef.node.value.value, file: file.path });
       }
     });
   }
@@ -43,12 +43,21 @@ export function validateRouteIntegration(files = []) {
   }
   const registered = new Set(routes.map((route) => route.path));
   const concreteRoutes = routes.filter((route) => route.path !== '*');
+  if (!concreteRoutes.length) return { passed: true, errors, routes, navigation, skippedNavigationValidation: true };
   if (concreteRoutes.length && !registered.has('/')) errors.push({ code: 'missing_root_route', message: 'Generated application has no route for /. Add a root page or redirect / to the primary route.', file: concreteRoutes[0].file });
+  const reportedNavigation = new Set();
   for (const item of navigation) {
     if (!item.path.startsWith('/') || item.path.startsWith('//') || item.path.includes(':')) continue;
+    const key = item.file + ':' + item.path;
+    if (reportedNavigation.has(key)) continue;
+    reportedNavigation.add(key);
     if (!registered.has(item.path)) errors.push({ code: 'unregistered_navigation', message: 'Navigation points to an unregistered route: ' + item.path, file: item.file });
   }
   return { passed: errors.length === 0, errors, routes, navigation };
+}
+
+function isAuthoritativeRouteFile(filePath) {
+  return filePath === 'src/App.jsx' || /^src\/(routes|app|navigation)\//.test(filePath);
 }
 
 function stringAttribute(attributes, name) {

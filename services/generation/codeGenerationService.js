@@ -51,37 +51,47 @@ export async function generateProjectFiles(project, options = {}) {
         project.currentBatch = stage.batches[0]?.batchNumber || completedBatches + 1;
         project.generationProgress = Math.max(5, Math.round((completedBatches / activeBatches.length) * 80));
         await project.save();
-        const results = await Promise.all(stage.batches.map((batch) => runGenerationBatch({
+
+        const results = await mapWithConcurrency(stage.batches, generationParallelism(), (batch, index) => runGenerationBatch({
           project,
           batch,
-          batchIndex: completedBatches,
+          batchIndex: completedBatches + index,
           totalBatches: activeBatches.length,
           previousFiles: stagePreviousFiles,
           contracts: stageContracts,
           warnings: stageWarnings,
           manifest,
           skipSave: true
-        })));
+        }));
+
+        const generatedStageFiles = results.flatMap(({ generated }) => normalizeGenerationResult(generated).files || []);
+        const repairedStageFiles = [];
         for (const { batch, generated } of results) {
-          const repairedGenerated = await repairGenerationBatch({ project, batch, generated, previousFiles: existingFiles, contracts, warnings });
+          const targetSet = new Set((batch.files || []).map(normalizeProjectPath));
+          const siblingFiles = generatedStageFiles.filter((file) => !targetSet.has(normalizeProjectPath(file.path)));
+          const repairContextFiles = mergeFiles(stagePreviousFiles, siblingFiles);
+          const repairedGenerated = await repairGenerationBatch({ project, batch, generated, previousFiles: repairContextFiles, contracts, warnings, manifest });
           for (const warning of repairedGenerated.warnings || []) warnings.push(warning);
           for (const contract of repairedGenerated.contracts || []) contracts.push(contract);
-          const proposedFiles = repairMissingRelativeImports(upsertGeneratedFiles(project.generatedFiles || [], repairedGenerated.files));
-          const proposedValidation = runStaticValidation(proposedFiles);
-          const changedPaths = new Set(repairedGenerated.files.map((file) => normalizeProjectPath(file.path)));
-          const blockingErrors = proposedValidation.errors.filter((error) => !error.file || changedPaths.has(error.file));
-          if (blockingErrors.length) throw new Error(blockingErrors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
-          project.generatedFiles = proposedFiles;
-          existingFiles = proposedFiles;
-          project.dependencyGraph = proposedValidation.graph;
-          lastValidProjectFiles = [...proposedFiles];
-          project.lastValidProjectFiles = lastValidProjectFiles;
-          completedBatches += 1;
-          project.generationWarnings = [...new Set(warnings)];
-          project.generationProgress = Math.max(project.generationProgress, Math.round((completedBatches / activeBatches.length) * 85));
-          await project.save();
-          await options.onFiles?.(repairedGenerated.files, project);
+          repairedStageFiles.push(...(repairedGenerated.files || []));
         }
+
+        const committed = await commitGeneratedFiles({
+          project,
+          newFiles: repairedStageFiles,
+          previousFiles: existingFiles,
+          warnings,
+          completedBatches: completedBatches + stage.batches.length,
+          totalBatches: activeBatches.length,
+          manifest
+        });
+        existingFiles = committed.files;
+        lastValidProjectFiles = [...committed.files];
+        project.lastValidProjectFiles = lastValidProjectFiles;
+        completedBatches += stage.batches.length;
+        project.currentBatch = stage.batches.at(-1)?.batchNumber || project.currentBatch;
+        await project.save();
+        await options.onFiles?.(committed.changedFiles, project);
       } else {
         for (const batch of stage.batches) {
           const generated = await runGenerationBatch({
@@ -94,24 +104,24 @@ export async function generateProjectFiles(project, options = {}) {
             warnings,
             manifest
           });
-          const repairedGenerated = await repairGenerationBatch({ project, batch, generated, previousFiles: existingFiles, contracts, warnings });
+          const repairedGenerated = await repairGenerationBatch({ project, batch, generated, previousFiles: existingFiles, contracts, warnings, manifest });
           for (const warning of repairedGenerated.warnings || []) warnings.push(warning);
           for (const contract of repairedGenerated.contracts || []) contracts.push(contract);
-          const proposedFiles = repairMissingRelativeImports(upsertGeneratedFiles(project.generatedFiles || [], repairedGenerated.files));
-          const proposedValidation = runStaticValidation(proposedFiles);
-          const changedPaths = new Set(repairedGenerated.files.map((file) => normalizeProjectPath(file.path)));
-          const blockingErrors = proposedValidation.errors.filter((error) => !error.file || changedPaths.has(error.file));
-          if (blockingErrors.length) throw new Error(blockingErrors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
-          project.generatedFiles = proposedFiles;
-          existingFiles = proposedFiles;
-          project.dependencyGraph = proposedValidation.graph;
-          lastValidProjectFiles = [...proposedFiles];
+          const committed = await commitGeneratedFiles({
+            project,
+            newFiles: repairedGenerated.files,
+            previousFiles: existingFiles,
+            warnings,
+            completedBatches: completedBatches + 1,
+            totalBatches: activeBatches.length,
+            manifest
+          });
+          existingFiles = committed.files;
+          lastValidProjectFiles = [...committed.files];
           project.lastValidProjectFiles = lastValidProjectFiles;
           completedBatches += 1;
-          project.generationWarnings = [...new Set(warnings)];
-          project.generationProgress = Math.max(project.generationProgress, Math.round((completedBatches / activeBatches.length) * 85));
           await project.save();
-          await options.onFiles?.(repairedGenerated.files, project);
+          await options.onFiles?.(committed.changedFiles, project);
         }
       }
     }
@@ -119,7 +129,7 @@ export async function generateProjectFiles(project, options = {}) {
     project.generationStatus = 'validating';
     project.generationProgress = 90;
     await project.save();
-    project.generatedFiles = repairMissingRelativeImports(project.generatedFiles || []);
+    project.generatedFiles = repairProjectFiles(project.generatedFiles || [], manifest, warnings);
     validateGeneratedFiles(project.generatedFiles || []);
     project.dependencyGraph = runStaticValidation(project.generatedFiles || []).graph;
     let smokeRenderTest = runSmokeRenderTests(project.generatedFiles || []);
@@ -132,7 +142,7 @@ export async function generateProjectFiles(project, options = {}) {
         smokeRenderTest = runSmokeRenderTests(project.generatedFiles || []);
         throw new Error('Smoke/render test failed after fix attempts: ' + smokeRenderTest.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
       }
-      project.generatedFiles = repairMissingRelativeImports(project.generatedFiles || []);
+      project.generatedFiles = repairProjectFiles(project.generatedFiles || [], manifest, warnings);
       validateGeneratedFiles(project.generatedFiles || []);
       project.dependencyGraph = runStaticValidation(project.generatedFiles || []).graph;
     }
@@ -160,19 +170,22 @@ export async function generateProjectFiles(project, options = {}) {
   }
 }
 
-export async function repairGenerationBatch({ project, batch, generated, previousFiles, contracts, warnings, maxAttempts = 3 }) {
+export async function repairGenerationBatch({ project, batch, generated, previousFiles, contracts, warnings, manifest = null, maxAttempts = 3 }) {
   const fallback = mockGenerateBatch({ project, targetFiles: batch.files, batch });
   let candidate = normalizeGenerationResult(generated);
   let lastError = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const deterministic = runDeterministicRepairs(previousFiles, candidate.files);
+    const deterministic = runDeterministicRepairs(previousFiles, candidate.files, manifest);
     candidate.files = deterministic.files;
     const previousPaths = new Set((previousFiles || []).map((file) => normalizeProjectPath(file.path)));
     const candidatePaths = new Set(candidate.files.map((file) => normalizeProjectPath(file.path)));
     const importRepaired = repairMissingRelativeImports(mergeFiles(previousFiles || [], candidate.files));
     candidate.files = importRepaired.filter((file) => candidatePaths.has(normalizeProjectPath(file.path)) || !previousPaths.has(normalizeProjectPath(file.path)));
-    if (deterministic.repairs.length) candidate.warnings = [...(candidate.warnings || []), ...deterministic.repairs.map((item) => 'Deterministic repair: ' + item.file + ' - ' + item.action)];
+    const postImportDeterministic = runDeterministicRepairs(previousFiles, candidate.files, manifest);
+    candidate.files = postImportDeterministic.files;
+    const repairWarnings = [...deterministic.repairs, ...postImportDeterministic.repairs];
+    if (repairWarnings.length) candidate.warnings = [...(candidate.warnings || []), ...repairWarnings.map((item) => 'Deterministic repair: ' + item.file + ' - ' + item.action)];
     try {
       validateGenerationBatch(candidate.files, batch.files, previousFiles);
       validateBatchGraph(candidate.files, previousFiles);
@@ -221,6 +234,85 @@ function validateBatchGraph(files, previousFiles) {
   if (blocking.length) {
     throw new Error(blocking.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
   }
+}
+
+async function commitGeneratedFiles({ project, newFiles, previousFiles, warnings, completedBatches, totalBatches, manifest }) {
+  const deterministic = runDeterministicRepairs(previousFiles || [], newFiles || [], manifest);
+  let filesToCommit = deterministic.files || [];
+  if (deterministic.repairs.length) {
+    warnings.push(...deterministic.repairs.map((item) => 'Deterministic repair: ' + item.file + ' - ' + item.action));
+  }
+
+  let proposedFiles = repairMissingRelativeImports(upsertGeneratedFiles(project.generatedFiles || [], filesToCommit));
+  const finalDeterministic = runDeterministicRepairs([], proposedFiles, manifest);
+  if (finalDeterministic.repairs.length) {
+    warnings.push(...finalDeterministic.repairs.map((item) => 'Final deterministic repair: ' + item.file + ' - ' + item.action));
+    proposedFiles = repairMissingRelativeImports(finalDeterministic.files || proposedFiles);
+  }
+  const changedPaths = changedPathSet(project.generatedFiles || [], filesToCommit, proposedFiles);
+  for (const repair of finalDeterministic.repairs || []) if (repair.file) changedPaths.add(normalizeProjectPath(repair.file));
+  const proposedValidation = runStaticValidation(proposedFiles);
+  const blockingErrors = proposedValidation.errors.filter((error) => isBlockingValidationError(error, changedPaths));
+  if (blockingErrors.length) throw new Error(blockingErrors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
+
+  project.generatedFiles = proposedFiles;
+  project.dependencyGraph = proposedValidation.graph;
+  project.generationWarnings = [...new Set(warnings)];
+  project.generationProgress = Math.max(project.generationProgress || 0, Math.round((completedBatches / totalBatches) * 85));
+  await project.save();
+
+  return {
+    files: proposedFiles,
+    changedFiles: proposedFiles.filter((file) => changedPaths.has(normalizeProjectPath(file.path)))
+  };
+}
+
+function changedPathSet(beforeFiles, newFiles, afterFiles) {
+  const beforePaths = new Set((beforeFiles || []).map((file) => normalizeProjectPath(file.path)));
+  const changed = new Set((newFiles || []).map((file) => normalizeProjectPath(file.path)));
+  for (const file of afterFiles || []) {
+    const filePath = normalizeProjectPath(file.path);
+    if (!beforePaths.has(filePath)) changed.add(filePath);
+  }
+  return changed;
+}
+
+function isBlockingValidationError(error, changedPaths) {
+  if (!error.file) return true;
+  let filePath = error.file;
+  try { filePath = normalizeProjectPath(error.file); } catch {}
+  if (changedPaths.has(filePath)) return true;
+  return [...changedPaths].some((changedPath) => String(error.message || '').includes(changedPath));
+}
+
+function repairProjectFiles(files, manifest, warnings) {
+  let repaired = repairMissingRelativeImports(files || []);
+  const deterministic = runDeterministicRepairs([], repaired, manifest);
+  if (deterministic.repairs.length) {
+    warnings.push(...deterministic.repairs.map((item) => 'Final deterministic repair: ' + item.file + ' - ' + item.action));
+  }
+  repaired = repairMissingRelativeImports(deterministic.files || repaired);
+  return repaired;
+}
+
+function generationParallelism() {
+  const configured = Number(process.env.GENERATION_PARALLELISM || 3);
+  if (!Number.isFinite(configured)) return 3;
+  return Math.min(6, Math.max(1, Math.floor(configured)));
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 function normalizeGenerationResult(result) {
@@ -302,7 +394,7 @@ async function runGenerationBatch({ project, batch, batchIndex, totalBatches, pr
   generated.files = returnedFiles.filter((file) => assigned.has(normalizeProjectPath(file.path)));
   if (rejectedPaths.length) generated.warnings = [...(generated.warnings || []), 'Ignored files outside this agent ownership: ' + rejectedPaths.join(', ')];
   assertOwnedBatchFiles(generated.files, batch, manifest);
-  return batch.concurrentGroup ? { batch, generated } : generated;
+  return skipSave || batch.concurrentGroup ? { batch, generated } : generated;
 }
 
 export function upsertGeneratedFiles(existingFiles, newFiles) {

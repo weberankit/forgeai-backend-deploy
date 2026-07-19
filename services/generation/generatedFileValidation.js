@@ -25,8 +25,8 @@ export function validateGenerationBatch(files, targetFiles, existingFiles = []) 
   const pathSet = new Set(normalized.map((file) => file.path));
   assertTargetsReturned(pathSet, targetFiles);
   const combined = normalizeAndValidateFileBasics(mergeFiles(existingFiles, files));
-  validateRelativeImports(combined, new Set(combined.map((file) => file.path)));
-  assertSymbols(combined);
+  validateRelativeImports(combined, new Set(combined.map((file) => file.path)), pathSet);
+  assertSymbols(combined, pathSet);
   return normalized;
 }
 
@@ -60,11 +60,14 @@ function normalizeAndValidateFileBasics(files) {
   return normalized;
 }
 
-function assertSymbols(files) {
+function assertSymbols(files, scopedPathSet = null) {
   const validation = validateProjectSymbols(files);
-  if (validation.errors.length) {
-    const error = httpError(400, validation.errors.map((item) => (item.file ? item.file + (item.line ? ':' + item.line : '') + ': ' : '') + item.message).join('; '));
-    error.findings = validation.errors;
+  const errors = scopedPathSet
+    ? validation.errors.filter((item) => isScopedFinding(item, scopedPathSet))
+    : validation.errors;
+  if (errors.length) {
+    const error = httpError(400, errors.map((item) => (item.file ? item.file + (item.line ? ':' + item.line : '') + ': ' : '') + item.message).join('; '));
+    error.findings = errors;
     throw error;
   }
 }
@@ -76,9 +79,10 @@ function assertTargetsReturned(pathSet, targetFiles = []) {
   }
 }
 
-function validateRelativeImports(files, pathSet) {
+function validateRelativeImports(files, pathSet, scopedPathSet = null) {
   for (const file of files) {
     if (!/\.(jsx|js)$/.test(file.path)) continue;
+    if (scopedPathSet && !scopedPathSet.has(file.path)) continue;
     const dir = path.posix.dirname(file.path);
     importRegex.lastIndex = 0;
     let match;
@@ -92,4 +96,12 @@ function validateRelativeImports(files, pathSet) {
       }
     }
   }
+}
+
+function isScopedFinding(item, scopedPathSet) {
+  if (!item.file) return true;
+  let filePath = item.file;
+  try { filePath = normalizeProjectPath(item.file); } catch {}
+  if (scopedPathSet.has(filePath)) return true;
+  return [...scopedPathSet].some((targetPath) => String(item.message || '').includes(targetPath));
 }

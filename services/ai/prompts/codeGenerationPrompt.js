@@ -48,7 +48,7 @@ export function buildCodeGenerationPrompt({ specification, blueprint, previousFi
     JSON.stringify(blueprint, null, 2),
     '',
     'Previously generated files:',
-    JSON.stringify(buildPreviousFileContext(previousFiles), null, 2),
+    JSON.stringify(buildPreviousFileContext(previousFiles, targetFiles, blueprint), null, 2),
     '',
     'Target files:',
     JSON.stringify(targetFiles, null, 2),
@@ -68,12 +68,41 @@ export function buildCodeGenerationPrompt({ specification, blueprint, previousFi
 }
 
 
-function buildPreviousFileContext(files = []) {
-  let remaining = 90000;
-  return files.map((file) => {
+function buildPreviousFileContext(files = [], targetFiles = [], blueprint = {}) {
+  const relevant = prioritizePreviousFiles(files, targetFiles, blueprint);
+  let remaining = Number(process.env.GENERATION_PREVIOUS_CONTEXT_CHARS || 45000);
+  if (!Number.isFinite(remaining) || remaining < 8000) remaining = 45000;
+  return relevant.map((file) => {
     const content = String(file.content || '');
     const included = content.slice(0, Math.max(0, Math.min(content.length, remaining)));
     remaining -= included.length;
     return { path: file.path, language: file.language, content: included, truncated: included.length < content.length };
   });
+}
+
+function prioritizePreviousFiles(files = [], targetFiles = [], blueprint = {}) {
+  const targetSet = new Set((targetFiles || []).map(String));
+  const blueprintFiles = new Map((blueprint.fileList || []).map((file) => [String(file.path || ''), file]));
+  const directDependencies = new Set(['package.json', 'src/index.css', 'src/data/mockData.js', 'src/components/AppShell.jsx', 'src/components/DataCard.jsx']);
+
+  for (const target of targetSet) {
+    for (const dependency of blueprintFiles.get(target)?.dependsOn || []) directDependencies.add(String(dependency));
+    if (target === 'src/App.jsx') {
+      for (const route of blueprint.routes || []) directDependencies.add('src/pages/' + String(route.component || 'HomePage').replace(/[^A-Za-z0-9]/g, '') + '.jsx');
+    }
+    if (target.startsWith('src/pages/')) {
+      directDependencies.add('src/components/AppShell.jsx');
+      directDependencies.add('src/data/mockData.js');
+    }
+  }
+
+  const scored = (files || []).map((file, index) => {
+    const path = String(file.path || '');
+    let score = 0;
+    if (directDependencies.has(path)) score += 100;
+    if (path === 'src/App.jsx' || path === 'src/main.jsx') score += 50;
+    if (targetSet.has(path)) score -= 100;
+    return { file, index, score };
+  });
+  return scored.sort((a, b) => b.score - a.score || a.index - b.index).map((item) => item.file);
 }

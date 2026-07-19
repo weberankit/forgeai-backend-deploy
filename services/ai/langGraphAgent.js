@@ -5,7 +5,11 @@ import { buildCodeGenerationPrompt } from './prompts/codeGenerationPrompt.js';
 import { buildGenerationRepairPrompt } from './prompts/generationRepairPrompt.js';
 import { buildEditPrompt } from './prompts/editPrompt.js';
 import { buildExplainPrompt } from './prompts/explainPrompt.js';
+import { buildRetryPrompt } from './prompts/retryPrompt.js';
 import { parseStructuredResponse, validateBlueprint, validateExpansionSpec } from './parseStructuredResponse.js';
+import { withCallLog } from '../observability/centralCallLogger.js';
+import { getTaskLlmConfig } from '../../config/taskLlmConfig.js';
+import { fetchLlmResponse } from './llmTransport.js';
 
 const AgentState = Annotation.Root({
   task: Annotation(),
@@ -70,29 +74,27 @@ const explainGraph = new StateGraph(AgentState)
   .compile();
 
 export async function runExpansionGraph({ prompt, imageDescription, fallback, onToken }) {
-  const state = await expansionGraph.invoke({
+  return runAgentGraph('expansion', expansionGraph, {
     task: 'expansion',
     prompt,
     imageDescription,
     fallbackResult: fallback,
     onToken
   });
-  return state.result;
 }
 
 export async function runPlanningGraph({ specification, clarification, fallback, onToken }) {
-  const state = await planningGraph.invoke({
+  return runAgentGraph('planning', planningGraph, {
     task: 'planning',
     specification,
     clarification,
     fallbackResult: fallback,
     onToken
   });
-  return state.result;
 }
 
 export async function runEditGraph({ project, message, targetFiles, dependencyContext, fallback }) {
-  const state = await editGraph.invoke({
+  return runAgentGraph('edit', editGraph, {
     task: 'edit',
     project,
     message,
@@ -100,22 +102,20 @@ export async function runEditGraph({ project, message, targetFiles, dependencyCo
     dependencyContext,
     fallbackResult: fallback
   });
-  return state.result;
 }
 
 export async function runExplainGraph({ question, graphSummary, fallback }) {
-  const state = await explainGraph.invoke({
+  return runAgentGraph('explain', explainGraph, {
     task: 'explain',
     message: question,
     graphSummary,
     fallbackExplanation: fallback,
     fallbackResult: fallback
   });
-  return state.result;
 }
 
 export async function runGenerationRepairGraph({ specification, blueprint, previousFiles, targetFiles, generatedFiles, validationError, contracts, warnings, fallback, agentName, phase, dependencyContext, attempt }) {
-  const state = await generationRepairGraph.invoke({
+  return runAgentGraph('generation_repair', generationRepairGraph, {
     task: 'generation_repair',
     specification,
     blueprint,
@@ -131,11 +131,10 @@ export async function runGenerationRepairGraph({ specification, blueprint, previ
     attempt,
     fallbackResult: fallback
   });
-  return state.result;
 }
 
 export async function runCodeGenerationGraph({ specification, blueprint, previousFiles, targetFiles, contracts, warnings, fallback, agentName, phase, dependencyContext }) {
-  const state = await codeGenerationGraph.invoke({
+  return runAgentGraph('code_generation', codeGenerationGraph, {
     task: 'code_generation',
     specification,
     blueprint,
@@ -148,7 +147,16 @@ export async function runCodeGenerationGraph({ specification, blueprint, previou
     dependencyContext,
     fallbackResult: fallback
   });
-  return state.result;
+}
+
+async function runAgentGraph(operation, graph, state) {
+  return withCallLog({
+    type: 'agent_call', operation, provider: 'langgraph',
+    metadata: { task: state.task, agentName: state.agentName, phase: state.phase, attempt: state.attempt }
+  }, async ({ callId }) => {
+    const result = await graph.invoke({ ...state, parentCallId: callId });
+    return result.result;
+  });
 }
 
 async function expansionNode(state) {
@@ -252,17 +260,22 @@ async function codeGenerationNode(state) {
 }
 
 async function callStructuredAgent({ operation, prompt, fallbackResult, validator, onToken }) {
-  const provider = process.env.AI_PROVIDER || 'mock';
+  const config = getTaskLlmConfig(operation);
+  const { provider } = config;
   let attemptPrompt = prompt;
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
+  for (let attempt = 1; attempt <= config.maxRetries; attempt += 1) {
     try {
-      const raw = provider === 'openai' ? await callOpenAI(attemptPrompt, { onToken }) : JSON.stringify(fallbackResult);
+      const raw = await withCallLog({
+        type: 'ai_call', operation, provider,
+        model: provider === 'openai' ? config.model : 'local-fallback',
+        metadata: { attempt, streaming: Boolean(onToken), promptLength: attemptPrompt.length, temperature: config.temperature }
+      }, () => provider === 'openai' ? callOpenAI(attemptPrompt, config, { onToken }) : JSON.stringify(fallbackResult));
       if (provider !== 'openai' && onToken) onToken(raw);
       return parseStructuredResponse(raw, validator);
     } catch (error) {
       console.warn('LangGraph structured agent output failed', { operation, attempt, message: error.message });
-      attemptPrompt = prompt + '\n\nYour previous response was rejected: ' + error.message + '\nReturn only valid JSON matching the exact requested shape. Do not include Markdown fences or commentary.';
-      if (attempt === 2) {
+      attemptPrompt = buildRetryPrompt(prompt, error);
+      if (attempt === config.maxRetries) {
         if (fallbackResult) {
           console.warn('LangGraph agent exhausted retries; using validated local fallback', { operation, message: error.message });
           const fallbackValidation = validator(fallbackResult);
@@ -274,25 +287,8 @@ async function callStructuredAgent({ operation, prompt, fallbackResult, validato
   }
 }
 
-async function callOpenAI(prompt, { onToken } = {}) {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error('OPENAI_API_KEY is required when AI_PROVIDER=openai.');
-  }
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Number(process.env.AI_REQUEST_TIMEOUT_MS || 90000));
-  let response;
-  try { response = await fetch('https://api.openai.com/v1/responses', {
-    method: 'POST',
-    headers: {
-      Authorization: 'Bearer ' + process.env.OPENAI_API_KEY,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ model: process.env.OPENAI_MODEL || 'gpt-4.1-mini', input: prompt, stream: Boolean(onToken), max_output_tokens: Number(process.env.OPENAI_MAX_OUTPUT_TOKENS || 16000) }),
-    signal: controller.signal
-  }); } catch (error) {
-    if (error.name === 'AbortError') throw new Error('AI request timed out after ' + Number(process.env.AI_REQUEST_TIMEOUT_MS || 90000) + 'ms.');
-    throw error;
-  } finally { clearTimeout(timeout); }
+async function callOpenAI(prompt, config, { onToken } = {}) {
+  const response = await fetchLlmResponse(config, { input: prompt, stream: Boolean(onToken) });
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
     throw new Error(data.error?.message || 'OpenAI request failed');

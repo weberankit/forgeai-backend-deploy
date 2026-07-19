@@ -77,6 +77,7 @@ function bridgeContent(filePath, targetPath) {
 }
 
 function fallbackModuleContent(filePath, componentName) {
+  if (filePath.endsWith('.css')) return '/* Generated fallback stylesheet to satisfy a missing CSS import. */\n';
   if (filePath.includes('/hooks/')) {
     const hookName = /^Use[A-Z]/.test(componentName) ? componentName[0].toLowerCase() + componentName.slice(1) : (/^use[A-Z]/.test(componentName) ? componentName : 'use' + componentName);
     return 'export function ' + hookName + "() {\n  const toggle = () => {};\n  return { value: false, isDarkMode: false, darkMode: false, toggle, toggleDarkMode: toggle };\n}\nexport default " + hookName + ';\n';

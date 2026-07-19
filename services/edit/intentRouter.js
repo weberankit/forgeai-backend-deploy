@@ -1,3 +1,8 @@
+import { withCallLog } from '../observability/centralCallLogger.js';
+import { getTaskLlmConfig } from '../../config/taskLlmConfig.js';
+import { fetchLlmResponse } from '../ai/llmTransport.js';
+import { buildIntentPrompt } from '../ai/prompts/intentPrompt.js';
+
 const allowedIntents = new Set(['edit', 'explain', 'build', 'unknown']);
 const intentCache = new Map();
 const INTENT_CACHE_MS = 30_000;
@@ -7,10 +12,11 @@ export async function routeChatIntent(message) {
   if (!text) return 'unknown';
   const cached = intentCache.get(text);
   if (cached && Date.now() - cached.createdAt < INTENT_CACHE_MS) return cached.intent;
-  if ((process.env.AI_PROVIDER || 'mock') === 'openai' && process.env.OPENAI_API_KEY) {
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
+  const config = getTaskLlmConfig('intent');
+  if (config.provider === 'openai' && config.apiKey) {
+    for (let attempt = 1; attempt <= config.maxRetries; attempt += 1) {
       try {
-        const intent = await classifyWithSmallModel(text);
+        const intent = await classifyWithSmallModel(text, config);
         rememberIntent(text, intent);
         return intent;
       } catch (error) {
@@ -28,22 +34,14 @@ function rememberIntent(message, intent) {
   if (intentCache.size > 200) intentCache.delete(intentCache.keys().next().value);
 }
 
-async function classifyWithSmallModel(message) {
-  const response = await fetch('https://api.openai.com/v1/responses', {
-    method: 'POST',
-    headers: { Authorization: 'Bearer ' + process.env.OPENAI_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: process.env.OPENAI_INTENT_MODEL || 'gpt-4.1-mini',
-      input: [
-        'Classify a message sent after a frontend project has been generated.',
-        'Return strict JSON only: {"intent":"edit|explain|build|unknown"}.',
-        'edit means the user wants any generated UI, code, content, style, layout, or behavior changed, including polite questions such as Can you edit the FAQ?',
-        'explain means the user wants information without changing files.',
-        'build means the user asks to create or regenerate a project.',
-        'Message: ' + JSON.stringify(message)
-      ].join('\n')
-    })
-  });
+async function classifyWithSmallModel(message, config) {
+  const { model } = config;
+  const response = await withCallLog({
+    type: 'ai_call', operation: 'intent_classification', provider: 'openai', model,
+    metadata: { messageLength: message.length }
+  }, () => fetchLlmResponse(config, {
+      input: buildIntentPrompt(message)
+  }));
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
     throw new Error(data.error?.message || 'Intent model request failed');

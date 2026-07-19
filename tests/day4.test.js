@@ -322,3 +322,28 @@ test('applies graph-targeted natural language edits with fallback in mock mode',
   assert.equal(result.status, 'preview_ready');
   assert.match(project.generatedFiles.find((file) => file.path === 'src/pages/HomePage.jsx').content, /Buy now/);
 });
+
+test('generation batch repair fixes missing IconComponent before validation can fail', async () => {
+  const project = {
+    expandedSpec: { projectName: 'Icon Repair App', projectSummary: 'Feature section with icon component' },
+    blueprint: { routes: [{ path: '/', component: 'HomePage' }], fileList: [] }
+  };
+  const batch = { batchNumber: 2, agentName: 'Component Agent', phase: 'component_registry', files: ['src/components/FeaturesSection.jsx'] };
+  const repaired = await repairGenerationBatch({
+    project,
+    batch,
+    generated: {
+      files: [{ path: 'src/components/FeaturesSection.jsx', language: 'jsx', content: "export default function FeaturesSection(){ return <section><IconComponent className='h-5 w-5' title='Feature' /></section> }" }],
+      contracts: [],
+      warnings: []
+    },
+    previousFiles: [],
+    contracts: [],
+    warnings: [],
+    maxAttempts: 1
+  });
+  const file = repaired.files.find((item) => item.path === 'src/components/FeaturesSection.jsx');
+  assert.match(file.content, /function IconComponent/);
+  assert.doesNotThrow(() => validateGenerationBatch(repaired.files, batch.files, []));
+});
+

@@ -13,7 +13,7 @@ const requiredIntegrationFiles = ['src/App.jsx', 'src/main.jsx'];
 
 const phaseMeta = {
   1: { phase: 'project_setup', agentName: 'Project Setup Agent', dependsOn: [] },
-  2: { phase: 'component_registry', agentName: 'Component Agent', dependsOn: ['Project Setup Agent'] },
+  2: { phase: 'component_registry', agentName: 'Component Agent', dependsOn: ['Project Setup Agent'], concurrentGroup: 'component_registry' },
   3: { phase: 'layout_and_routing', agentName: 'Layout Agent', dependsOn: ['Component Agent'] },
   4: { phase: 'pages_and_features', agentName: 'Page Agent', dependsOn: ['Layout Agent'], concurrentGroup: 'page_and_styling' },
   5: { phase: 'styling_system', agentName: 'Styling Agent', dependsOn: ['Layout Agent'], concurrentGroup: 'page_and_styling' },
@@ -69,6 +69,8 @@ function classify(filePath) {
   return 4;
 }
 
+const phaseChunkSizes = { 1: 10, 2: 6, 3: 8, 4: 4, 5: 6, 6: 10 };
+
 function chunk(items, size = 8) {
   const chunks = [];
   for (let index = 0; index < items.length; index += size) chunks.push(items.slice(index, index + size));
@@ -106,7 +108,7 @@ export function buildGenerationBatches(blueprint = {}) {
   for (const group of [1, 2, 3, 4, 5, 6]) {
     const groupFiles = grouped.get(group) || [];
     const meta = phaseMeta[group];
-    for (const files of chunk(groupFiles, group === 1 ? 10 : 20)) {
+    for (const files of chunk(groupFiles, phaseChunkSizes[group] || 8)) {
       batches.push({
         batchNumber: batches.length + 1,
         phase: meta.phase,
@@ -129,7 +131,7 @@ export function buildAgentExecutionStages(batches = []) {
   const stage = (phase, parallel = false) => ({ phase, parallel, batches: byPhase.get(phase) || [] });
   return [
     stage('project_setup'),
-    stage('component_registry'),
+    stage('component_registry', true),
     stage('layout_and_routing'),
     { phase: 'page_and_styling', parallel: true, batches: [...(byPhase.get('pages_and_features') || []), ...(byPhase.get('styling_system') || [])] },
     stage('integration')

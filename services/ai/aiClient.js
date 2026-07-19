@@ -39,6 +39,13 @@ function mockExpansion(prompt, imageDescription) {
 }
 
 function inferDomain(prompt) {
+  if (/book|bookstore|novel|author|reading|library|sell.*book|book.*sell/.test(prompt)) return {
+    targetUsers: ['Book buyers', 'Readers', 'Collectors'],
+    routes: [{ path: '/', component: 'LandingPage', purpose: 'Bookstore landing and purchase discovery' }],
+    components: ['Navbar', 'BookHero', 'FeaturedBooks', 'CategoryFilter', 'AuthorSpotlight', 'Testimonials', 'NewsletterSignup', 'Footer'],
+    features: ['Bookstore hero call to action', 'Featured book catalog', 'Category filtering', 'Author spotlight', 'Reader testimonials', 'Newsletter signup'],
+    design: 'Warm editorial bookstore landing page focused on selling books'
+  };
   if (/landing|saas|marketing|pricing/.test(prompt)) return {
     targetUsers: ['Prospective customers', 'Product buyers'],
     routes: [{ path: '/', component: 'LandingPage', purpose: 'Marketing landing experience' }],

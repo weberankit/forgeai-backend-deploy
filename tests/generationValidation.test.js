@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { validateProjectSymbols } from '../services/review/symbolValidation.js';
 import { runDeterministicRepairs } from '../services/generation/deterministicRepair.js';
 import { assertDisjointWriteSets, buildProjectManifest } from '../services/generation/projectManifest.js';
-import { buildGenerationBatches } from '../services/generation/generationBatches.js';
+import { buildAgentExecutionStages, buildGenerationBatches } from '../services/generation/generationBatches.js';
+import { validateGenerationBatch } from '../services/generation/generatedFileValidation.js';
+import { validateRouteIntegration } from '../services/review/routeValidation.js';
 import { expandSpecification, planFrontendProject } from '../services/ai/aiClient.js';
 
 test('deterministically removes duplicate declarations and redundant named exports', () => {
@@ -69,3 +71,165 @@ test('prompt-aware fallback blueprint preserves requested landing-page features 
   assert.equal(blueprint.routes[0].path, '/');
   if (previousProvider === undefined) delete process.env.AI_PROVIDER; else process.env.AI_PROVIDER = previousProvider;
 });
+
+test('batch validation scopes errors to generated targets and allows staged sibling context', () => {
+  const existing = [
+    { path: 'src/pages/BrokenPeer.jsx', content: "import Missing from '../components/Missing.jsx'; export default function BrokenPeer(){ return <Missing /> }" },
+    { path: 'src/pages/HomePage.css', content: '.home { color: inherit; }' }
+  ];
+  assert.doesNotThrow(() => validateGenerationBatch([
+    { path: 'src/pages/HomePage.jsx', language: 'jsx', content: "import './HomePage.css'; export default function HomePage(){ return <main className='home' /> }" }
+  ], ['src/pages/HomePage.jsx'], existing));
+  assert.throws(() => validateGenerationBatch([
+    { path: 'src/pages/HomePage.jsx', language: 'jsx', content: "import Missing from '../components/Missing.jsx'; export default function HomePage(){ return <Missing /> }" }
+  ], ['src/pages/HomePage.jsx'], existing), /Relative import does not resolve|Missing relative import/);
+});
+
+test('component batches are split into parallelizable chunks for faster multi-agent generation', () => {
+  const fileList = Array.from({ length: 13 }, (_, index) => ({ path: 'src/components/Widget' + index + '.jsx', dependsOn: [] }));
+  const batches = buildGenerationBatches({ routes: [{ path: '/', component: 'HomePage' }], fileList });
+  const stages = buildAgentExecutionStages(batches);
+  const componentStage = stages.find((stage) => stage.phase === 'component_registry');
+  assert.equal(componentStage.parallel, true);
+  assert.ok(componentStage.batches.length >= 3);
+  assert.ok(componentStage.batches.every((batch) => batch.files.length <= 6));
+});
+
+test('deterministic repair rewrites default data import when previous module only has a named export', () => {
+  const result = runDeterministicRepairs([
+    { path: 'src/data/categories.js', content: "export const categories = ['Fiction', 'History'];\n" }
+  ], [
+    { path: 'src/components/CategoryFilter.jsx', content: "import categories from '../data/categories.js'; export default function CategoryFilter(){ return <select>{categories.map((category) => <option key={category}>{category}</option>)}</select> }" }
+  ]);
+  const filter = result.files.find((file) => file.path === 'src/components/CategoryFilter.jsx');
+  assert.match(filter.content, /import \{ categories \} from '\.\.\/data\/categories\.js';/);
+  assert.equal(result.validation.passed, true);
+});
+
+test('deterministic repair adds default export when generated data module is imported as default', () => {
+  const result = runDeterministicRepairs([], [
+    { path: 'src/data/categories.js', content: "export const categories = ['Fiction', 'History'];\n" },
+    { path: 'src/components/CategoryFilter.jsx', content: "import categories from '../data/categories.js'; export default function CategoryFilter(){ return <select>{categories.map((category) => <option key={category}>{category}</option>)}</select> }" }
+  ]);
+  const data = result.files.find((file) => file.path === 'src/data/categories.js');
+  assert.match(data.content, /export default categories;/);
+  assert.equal(result.validation.passed, true);
+});
+
+test('deterministic repair aligns named component import to default export', () => {
+  const result = runDeterministicRepairs([
+    { path: 'src/components/BookCard.jsx', content: 'export default function BookCard(){ return <article /> }\n' }
+  ], [
+    { path: 'src/pages/LandingPage.jsx', content: "import { BookCard } from '../components/BookCard.jsx'; export default function LandingPage(){ return <BookCard /> }" }
+  ]);
+  const page = result.files.find((file) => file.path === 'src/pages/LandingPage.jsx');
+  assert.match(page.content, /import BookCard from '\.\.\/components\/BookCard\.jsx';/);
+  assert.equal(result.validation.passed, true);
+});
+
+test('prompt-aware fallback treats selling books as a bookstore landing page', async () => {
+  const previousProvider = process.env.AI_PROVIDER;
+  process.env.AI_PROVIDER = 'mock';
+  const spec = await expandSpecification({ prompt: 'Create a landing page for selling books' });
+  const blueprint = await planFrontendProject({ specification: spec });
+  assert.equal(spec.routes[0].component, 'LandingPage');
+  assert.ok(spec.coreFeatures.some((feature) => /book|catalog/i.test(feature)));
+  assert.ok(spec.sharedComponents.some((component) => /CategoryFilter|FeaturedBooks/i.test(component)));
+  assert.ok(blueprint.fileList.some((file) => file.path === 'src/pages/LandingPage.jsx'));
+  if (previousProvider === undefined) delete process.env.AI_PROVIDER; else process.env.AI_PROVIDER = previousProvider;
+});
+
+test('route validation does not fail shared header navigation before App routes exist', () => {
+  const result = validateRouteIntegration([
+    { path: 'src/components/Header.jsx', content: "import { Link } from 'react-router-dom'; const navigation = [{ label: 'Home', path: '/' }]; export default function Header(){ return <header><Link to='/'>Home</Link></header> }" }
+  ]);
+  assert.equal(result.passed, true);
+  assert.equal(result.skippedNavigationValidation, true);
+});
+
+test('route validation deduplicates repeated unregistered navigation errors once routes exist', () => {
+  const result = validateRouteIntegration([
+    { path: 'src/App.jsx', content: "import { Route, Routes } from 'react-router-dom'; function CatalogPage(){ return <main /> } export default function App(){ return <Routes><Route path='/catalog' element={<CatalogPage />} /></Routes> }" },
+    { path: 'src/components/Header.jsx', content: "import { Link } from 'react-router-dom'; const navigation = [{ label: 'Home', path: '/' }]; export default function Header(){ return <header><Link to='/'>Home</Link></header> }" }
+  ]);
+  assert.equal(result.errors.filter((error) => error.code === 'unregistered_navigation' && /: \/$/.test(error.message)).length, 1);
+});
+
+test('deterministic repair adds root route when generated navigation links to root', () => {
+  const result = runDeterministicRepairs([], [
+    { path: 'src/App.jsx', content: "import { Route, Routes } from 'react-router-dom'; function CatalogPage(){ return <main /> } export default function App(){ return <Routes><Route path='/catalog' element={<CatalogPage />} /></Routes> }" },
+    { path: 'src/components/Header.jsx', content: "import { Link } from 'react-router-dom'; const navigation = [{ label: 'Home', path: '/' }]; export default function Header(){ return <header><Link to='/'>Home</Link></header> }" }
+  ]);
+  const app = result.files.find((file) => file.path === 'src/App.jsx');
+  assert.match(app.content, /<Route path="\/" element=\{<CatalogPage \/>\}/);
+  assert.equal(validateRouteIntegration(result.files).passed, true);
+  assert.ok(result.repairs.some((repair) => repair.code === 'MISSING_ROOT_ROUTE'));
+});
+
+test('deterministic repair defines missing IconComponent rendered by generated feature sections', () => {
+  const result = runDeterministicRepairs([], [
+    { path: 'src/components/FeaturesSection.jsx', content: "export default function FeaturesSection(){ return <section><IconComponent className='h-5 w-5' title='Feature' /></section> }" }
+  ]);
+  const file = result.files.find((item) => item.path === 'src/components/FeaturesSection.jsx');
+  assert.match(file.content, /function IconComponent/);
+  assert.equal(validateProjectSymbols(result.files).passed, true);
+  assert.ok(result.repairs.some((repair) => repair.code === 'UNDEFINED_RENDERED_COMPONENT' && repair.file === 'src/components/FeaturesSection.jsx'));
+});
+
+test('deterministic repair defines generic missing rendered components without hiding imported components', () => {
+  const result = runDeterministicRepairs([], [
+    { path: 'src/components/FeatureGrid.jsx', content: "import ExistingCard from './ExistingCard.jsx'; export default function FeatureGrid(){ return <div><ExistingCard /><FeatureCard title='Fast' /></div> }" },
+    { path: 'src/components/ExistingCard.jsx', content: "export default function ExistingCard(){ return <article /> }" }
+  ]);
+  const file = result.files.find((item) => item.path === 'src/components/FeatureGrid.jsx');
+  assert.match(file.content, /function FeatureCard/);
+  assert.doesNotMatch(file.content, /function ExistingCard/);
+  assert.equal(validateProjectSymbols(result.files).passed, true);
+});
+
+test('deterministic repair removes duplicate Redux action exports from destructured cart slice actions', () => {
+  const source = `
+import { createSlice } from '@reduxjs/toolkit';
+
+const cartSlice = createSlice({
+  name: 'cart',
+  initialState: { items: [] },
+  reducers: {
+    addItem(state, action) { state.items.push(action.payload); },
+    updateQuantity(state) { return state; },
+    removeItem(state) { return state; },
+    clearCart(state) { state.items = []; }
+  }
+});
+
+export const { clearCart, addItem, updateQuantity, removeItem } = cartSlice.actions;
+export default cartSlice.reducer;
+export { clearCart };
+export { addItem };
+export { updateQuantity };
+export { removeItem };
+`;
+  const result = runDeterministicRepairs([], [{ path: 'src/redux/cartSlice.js', content: source }]);
+  const file = result.files.find((item) => item.path === 'src/redux/cartSlice.js');
+  assert.equal((file.content.match(/export \{ clearCart \}/g) || []).length, 0);
+  assert.equal((file.content.match(/export \{ addItem \}/g) || []).length, 0);
+  assert.equal((file.content.match(/export \{ updateQuantity \}/g) || []).length, 0);
+  assert.equal((file.content.match(/export \{ removeItem \}/g) || []).length, 0);
+  assert.equal(validateProjectSymbols(result.files).passed, true);
+  assert.ok(result.repairs.some((repair) => repair.code === 'DUPLICATE_NAMED_EXPORT'));
+});
+
+test('deterministic repair removes duplicate selector declarations with same name', () => {
+  const source = `
+export const selectSelectedBatDetailsSelector = (state) => state.bats.selected;
+export const selectSelectedBatDetailsSelector = (state) => state.bats.selectedDetails;
+export const selectOtherBatSelector = (state) => state.bats.other;
+`;
+  const result = runDeterministicRepairs([], [{ path: 'src/redux/batSlice.js', content: source }]);
+  const file = result.files.find((item) => item.path === 'src/redux/batSlice.js');
+  assert.equal((file.content.match(/export const selectSelectedBatDetailsSelector/g) || []).length, 1);
+  assert.equal((file.content.match(/selectOtherBatSelector/g) || []).length, 1);
+  assert.equal(validateProjectSymbols(result.files).passed, true);
+  assert.ok(result.repairs.some((repair) => repair.code === 'DUPLICATE_DECLARATION'));
+});
+

@@ -357,7 +357,7 @@ export async function fixProject(req, res, next) {
     const result = await runFixLoop(project, {
       runtimeOutput: String(req.body.runtimeOutput || ''),
       runtimeEvidence: req.body.runtimeEvidence && typeof req.body.runtimeEvidence === 'object' ? req.body.runtimeEvidence : {},
-      maxAttempts: 3
+      maxAttempts: 2
     });
     res.json({ project: serializeProject(project), result });
   } catch (error) { next(error); }

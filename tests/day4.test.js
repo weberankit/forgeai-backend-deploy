@@ -12,6 +12,7 @@ import { explainProjectQuestion } from '../services/explain/explainAgent.js';
 import { buildDependencyGraph } from '../services/review/dependencyGraph.js';
 import { repairMissingRelativeImports } from '../services/generation/importRepair.js';
 import { resolveEditTargets } from '../services/edit/editTargeting.js';
+import { validateEditOperations } from '../services/edit/editOperations.js';
 import { routeChatIntent } from '../services/edit/intentRouter.js';
 import { resolveRuntimeRepairTargets } from '../services/review/fixAgent.js';
 import { appendVerifiedFixMemoryRecord, buildErrorSignature, buildKnownPitfallsPrompt, retrieveVerifiedFixes } from '../services/memory/verifiedFixMemory.js';
@@ -74,6 +75,28 @@ test('targets generated page files for hero visual edits', () => {
   const result = resolveEditTargets(project, 'Make the hero section darker');
   assert.equal(result.needsClarification, false);
   assert.ok(result.targets.includes('src/pages/HomePage.jsx'));
+});
+
+test('edit targeting uses AST component symbols and includes integration parents', () => {
+  const files = [
+    { path: 'src/App.jsx', content: "import CheckoutPanel from './components/CheckoutPanel.jsx'; export default function App(){ return <CheckoutPanel /> }" },
+    { path: 'src/components/CheckoutPanel.jsx', content: 'export default function CheckoutPanel(){ function confirmOrder(){} return <button onClick={confirmOrder}>Confirm</button> }' },
+    { path: 'src/components/Footer.jsx', content: 'export default function Footer(){ return <footer /> }' }
+  ];
+  const project = { generatedFiles: files, dependencyGraph: buildDependencyGraph(files) };
+  const result = resolveEditTargets(project, 'Update the confirmOrder behavior in CheckoutPanel');
+  assert.equal(result.needsClarification, false);
+  assert.ok(result.targets.includes('src/components/CheckoutPanel.jsx'));
+  assert.ok(result.targets.includes('src/App.jsx'));
+  assert.ok(!result.targets.includes('src/components/Footer.jsx'));
+  assert.ok(result.candidates.some((candidate) => candidate.reasons.some((reason) => reason.startsWith('ast:'))));
+});
+
+test('edit operations allow safe component creation and reject unapproved updates', () => {
+  const existing = [{ path: 'src/App.jsx', language: 'jsx', content: 'export default function App(){ return <main /> }' }];
+  const created = validateEditOperations(existing, [{ operation: 'create', path: 'src/components/Modal.jsx', content: 'export default function Modal(){ return <div /> }' }], ['src/App.jsx'], 'add a modal');
+  assert.equal(created[0].operation, 'create');
+  assert.throws(() => validateEditOperations(existing, [{ operation: 'update', path: 'src/App.jsx', content: 'changed' }], [], 'change app'), /outside the approved/);
 });
 
 test('builds generalized verified fix signature', () => {

@@ -1,18 +1,32 @@
 import { randomUUID } from 'crypto';
 import { resolveEditTargets } from './editTargeting.js';
-import { createSnapshot, applyFileChanges } from '../review/versioningService.js';
+import { createSnapshot } from '../review/versioningService.js';
+import { applyEditOperationsToFiles, validateEditOperations } from './editOperations.js';
 import { runStaticValidation } from '../review/staticValidation.js';
 import { runFixLoop } from '../review/fixAgent.js';
 import { runEditGraph } from '../ai/langGraphAgent.js';
 import { buildKnownPitfallsPrompt, retrieveVerifiedFixes } from '../memory/verifiedFixMemory.js';
 
 export async function applyNaturalLanguageEdit(project, message) {
+  const refreshed = runStaticValidation(project.generatedFiles || []);
+  project.dependencyGraph = refreshed.graph;
   const targeting = resolveEditTargets(project, message);
   if (targeting.needsClarification) return saveClarification(project, 'Which file or section should I update?', targeting.targets);
-  const changes = await produceEditChanges(project, message, targeting.targets);
-  if (!changes.length) return saveClarification(project, 'I could not produce a safe edit. Please describe the exact visual or behavior change you want.', targeting.targets);
+  const editResult = await produceEditChanges(project, message, targeting.targets);
+  if (!editResult.changes.length) {
+    const detail = editResult.warnings.length ? ' ' + editResult.warnings.join(' ') : '';
+    return saveClarification(project, 'Edit was not applied because no valid file changes were produced.' + detail, targeting.targets, editResult.warnings);
+  }
+  let changes;
+  try {
+    changes = validateEditOperations(project.generatedFiles || [], editResult.changes, targeting.targets, message);
+  } catch (error) {
+    return saveClarification(project, 'Edit was not applied: ' + error.message, targeting.targets, [error.message]);
+  }
   createSnapshot(project, 'edit', message);
-  applyFileChanges(project, changes, 'edit', randomUUID());
+  const operationId = randomUUID();
+  project.generatedFiles = applyEditOperationsToFiles(project.generatedFiles || [], changes, operationId);
+  project.lastChangedFiles = changes.map((change) => change.path);
   project.lastEditMessage = message;
   project.operationStatus = 'validating';
   const validation = runStaticValidation(project.generatedFiles || []);
@@ -20,7 +34,7 @@ export async function applyNaturalLanguageEdit(project, message) {
   if (!validation.passed) await runFixLoop(project, { maxAttempts: 3 });
   else project.operationStatus = 'preview_ready';
   await project.save();
-  return { status: project.operationStatus, changes, targets: targeting.targets, validation };
+  return { status: project.operationStatus, changes, targets: targeting.targets, warnings: editResult.warnings, validation };
 }
 
 async function produceEditChanges(project, message, targets) {
@@ -37,6 +51,8 @@ async function produceEditChanges(project, message, targets) {
   });
   const dependencyContext = {
     targetGraph: Object.fromEntries(targets.map((target) => [target, graph[target] || {}])),
+    targetSelection: resolveEditTargets(project, message),
+    allowedCreateRoots: ['src/pages/', 'src/components/', 'src/layouts/', 'src/hooks/', 'src/utils/', 'src/data/'],
     knownPitfalls: buildKnownPitfallsPrompt(knownPitfalls)
   };
   const result = await runEditGraph({
@@ -44,13 +60,14 @@ async function produceEditChanges(project, message, targets) {
     message,
     targetFiles,
     dependencyContext,
-    fallback: { changes: fallbackChanges, warnings: [] }
-  }).catch(() => ({ changes: fallbackChanges, warnings: ['LLM edit failed; deterministic fallback used.'] }));
+    fallback: { changes: fallbackChanges, warnings: ['Edit LLM is unavailable; deterministic fallback was used.'] }
+  }).catch((error) => ({ changes: fallbackChanges, warnings: ['Edit LLM failed: ' + error.message] }));
   const allowedTargets = new Set(targets);
-  return (result.changes || [])
-    .filter((change) => allowedTargets.has(change.path))
-    .map((change) => ({ path: change.path, changeType: 'update', content: change.content, reason: change.reason || 'Applied requested edit: ' + message, addressesFindingIds: [] }))
+  const changes = (result.changes || [])
+    .filter((change) => change.operation === 'create' || change.changeType === 'create' || allowedTargets.has(change.path))
+    .map((change) => ({ ...change, operation: change.operation || change.changeType || 'update', reason: change.reason || 'Applied requested edit: ' + message, addressesFindingIds: [] }))
     .slice(0, 8);
+  return { changes, warnings: result.warnings || [] };
 }
 
 function produceDeterministicEditChanges(project, message, targets) {
@@ -87,8 +104,8 @@ function addProgressBar(content) {
 }
 function addLocalStorageHint(content) { if (content.includes('localStorage')) return content; return String(content).replace('export default function', "const storageKey = 'generated-app-state';\nfunction saveState(value) { localStorage.setItem(storageKey, JSON.stringify(value)); }\n\nexport default function"); }
 
-async function saveClarification(project, clarification, targets = []) {
+async function saveClarification(project, clarification, targets = [], warnings = []) {
   project.operationStatus = 'needs_clarification';
   await project.save();
-  return { status: 'needs_clarification', clarification, targets };
+  return { status: 'needs_clarification', clarification, targets, warnings };
 }

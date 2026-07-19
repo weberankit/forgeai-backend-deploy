@@ -351,7 +351,8 @@ function validateEditResponse(value) {
   if (!value || !Array.isArray(value.changes)) return { valid: false, message: 'changes must be an array' };
   for (const change of value.changes) {
     if (!change.path || typeof change.path !== 'string') return { valid: false, message: 'change.path is required' };
-    if (typeof change.content !== 'string' || change.content.length === 0) return { valid: false, message: 'change.content is required' };
+    const operation = change.operation || change.changeType || 'update';
+    if (operation !== 'delete' && (typeof change.content !== 'string' || change.content.length === 0)) return { valid: false, message: 'change.content is required' };
   }
   if (!Array.isArray(value.warnings)) return { valid: false, message: 'warnings must be an array' };
   return { valid: true };

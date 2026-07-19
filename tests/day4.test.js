@@ -13,6 +13,7 @@ import { buildDependencyGraph } from '../services/review/dependencyGraph.js';
 import { repairMissingRelativeImports } from '../services/generation/importRepair.js';
 import { resolveEditTargets } from '../services/edit/editTargeting.js';
 import { routeChatIntent } from '../services/edit/intentRouter.js';
+import { resolveRuntimeRepairTargets } from '../services/review/fixAgent.js';
 import { appendVerifiedFixMemoryRecord, buildErrorSignature, buildKnownPitfallsPrompt, retrieveVerifiedFixes } from '../services/memory/verifiedFixMemory.js';
 
 test('rejects unsafe generated paths', () => {
@@ -36,6 +37,33 @@ test('extracts AST import and render graph', () => {
   assert.deepEqual(graph['src/App.jsx'].imports, ['src/pages/HomePage.jsx']);
   assert.deepEqual(graph['src/App.jsx'].renders, ['HomePage']);
   assert.deepEqual(graph['src/pages/HomePage.jsx'].importedBy, ['src/App.jsx']);
+});
+
+test('runtime repair targets an exact stack file and its dependency neighbors', () => {
+  const files = [
+    { path: 'src/App.jsx', content: "import ProductPage from './pages/ProductPage.jsx'; export default function App(){ return <ProductPage /> }" },
+    { path: 'src/pages/ProductPage.jsx', content: 'export default function ProductPage(){ return <main>{products.length}</main> }' },
+    { path: 'src/pages/AboutPage.jsx', content: 'export default function AboutPage(){ return <main>About</main> }' }
+  ];
+  const project = { generatedFiles: files, dependencyGraph: buildDependencyGraph(files) };
+  const targets = resolveRuntimeRepairTargets(project, 'ReferenceError: products is not defined\n at ProductPage.jsx:42:18');
+  assert.ok(targets.includes('src/pages/ProductPage.jsx'));
+  assert.ok(targets.includes('src/App.jsx'));
+  assert.ok(!targets.includes('src/pages/AboutPage.jsx'));
+});
+
+test('runtime repair uses AST symbols and bounded app/page fallback without a filename', () => {
+  const files = [
+    { path: 'src/App.jsx', content: "import CartPage from './pages/CartPage.jsx'; export default function App(){ return <CartPage /> }" },
+    { path: 'src/pages/CartPage.jsx', content: 'export default function CartPage(){ return <main>{cartItems.map(String)}</main> }' },
+    { path: 'src/pages/AboutPage.jsx', content: 'export default function AboutPage(){ return <main>About</main> }' }
+  ];
+  const project = { generatedFiles: files, dependencyGraph: buildDependencyGraph(files) };
+  const symbolTargets = resolveRuntimeRepairTargets(project, 'ReferenceError: cartItems is not defined');
+  assert.ok(symbolTargets.includes('src/pages/CartPage.jsx'));
+  const fallbackTargets = resolveRuntimeRepairTargets(project, 'TypeError: Cannot read properties of undefined');
+  assert.ok(fallbackTargets.includes('src/App.jsx'));
+  assert.ok(fallbackTargets.length <= 8);
 });
 
 test('targets generated page files for hero visual edits', () => {
@@ -346,4 +374,3 @@ test('generation batch repair fixes missing IconComponent before validation can 
   assert.match(file.content, /function IconComponent/);
   assert.doesNotThrow(() => validateGenerationBatch(repaired.files, batch.files, []));
 });
-

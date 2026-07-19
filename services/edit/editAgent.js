@@ -1,6 +1,5 @@
 import { randomUUID } from 'crypto';
 import { resolveEditTargets } from './editTargeting.js';
-import { routeChatIntent } from './intentRouter.js';
 import { createSnapshot, applyFileChanges } from '../review/versioningService.js';
 import { runStaticValidation } from '../review/staticValidation.js';
 import { runFixLoop } from '../review/fixAgent.js';
@@ -8,8 +7,6 @@ import { runEditGraph } from '../ai/langGraphAgent.js';
 import { buildKnownPitfallsPrompt, retrieveVerifiedFixes } from '../memory/verifiedFixMemory.js';
 
 export async function applyNaturalLanguageEdit(project, message) {
-  const intent = await routeChatIntent(message);
-  if (intent !== 'edit') return saveClarification(project, 'Tell me what generated UI change you want to make.');
   const targeting = resolveEditTargets(project, message);
   if (targeting.needsClarification) return saveClarification(project, 'Which file or section should I update?', targeting.targets);
   const changes = await produceEditChanges(project, message, targeting.targets);

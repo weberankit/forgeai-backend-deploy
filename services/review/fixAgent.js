@@ -8,11 +8,11 @@ import { repairMissingRelativeImports } from '../generation/importRepair.js';
 import { languageForPath, normalizeProjectPath } from '../generation/pathSafety.js';
 import path from 'path';
 
-export async function runFixLoop(project, { runtimeOutput = '', maxAttempts = 3 } = {}) {
+export async function runFixLoop(project, { runtimeOutput = '', runtimeEvidence = {}, maxAttempts = 3 } = {}) {
   const runs = [];
   let pendingVerifiedFix = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const review = await runQualityReview({ project, runtimeOutput, attempt });
+    const review = await runQualityReview({ project, runtimeOutput, runtimeEvidence, attempt });
     runs.push(review);
     project.reviewHistory.push(review);
     if (review.status === 'passed') {
@@ -87,6 +87,7 @@ async function produceDynamicLlmFixes(project, review, attempt) {
   const files = project.generatedFiles || [];
   const validation = runStaticValidation(files);
   const targetPaths = new Set(blocking.map((finding) => finding.file).filter(Boolean));
+  for (const target of resolveRuntimeRepairTargets(project, review.runtimeOutput, review.runtimeEvidence)) targetPaths.add(target);
   for (const error of validation.errors.filter((item) => item.code === 'missing_relative_import')) {
     targetPaths.add(error.file);
     const specifier = error.message.replace(/^Missing relative import:\s*/, '');
@@ -102,13 +103,16 @@ async function produceDynamicLlmFixes(project, review, attempt) {
     previousFiles: files.filter((file) => !targets.includes(normalizeProjectPath(file.path))),
     targetFiles: targets,
     generatedFiles: targets.map((filePath) => current.get(filePath)).filter(Boolean),
-    validationError: validation.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '),
+    validationError: [
+      review.runtimeOutput ? 'Runtime error:\n' + review.runtimeOutput : '',
+      validation.errors.length ? 'Static validation:\n' + validation.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; ') : ''
+    ].filter(Boolean).join('\n\n'),
     contracts: [],
     warnings: project.generationWarnings || [],
     fallback: { files: repairMissingRelativeImports(files).filter((file) => targets.includes(normalizeProjectPath(file.path))), contracts: [], warnings: [] },
     agentName: 'Dynamic Preview Repair Agent',
     phase: 'runtime_and_import_repair',
-    dependencyContext: { findings: blocking, dependencyGraph: validation.graph, instruction: 'Create missing modules and correct imports/exports. Never delete a required feature import merely to pass validation.' },
+    dependencyContext: { runtimeEvidence: review.runtimeEvidence || {}, findings: blocking, dependencyGraph: validation.graph, instruction: 'Use the runtime stack, source, route, symbols, and related graph files to identify the root cause. Create missing modules and correct imports/exports. Never delete a required feature import merely to pass validation.' },
     attempt
   });
   const changes = (result?.files || []).filter((file) => targets.includes(normalizeProjectPath(file.path))).map((file) => ({
@@ -121,6 +125,65 @@ async function produceDynamicLlmFixes(project, review, attempt) {
   }));
   return { changes: dedupe(changes), verificationSteps: ['Run static validation', 'Refresh WebContainer preview'], resolvedFindingIds: blocking.map((finding) => finding.id), unresolvedIssues: [], requiresFullReview: true };
 }
+
+export function resolveRuntimeRepairTargets(project, runtimeOutput = '', runtimeEvidence = {}, maxTargets = 8) {
+  const files = project.generatedFiles || [];
+  const paths = files.map((file) => normalizeProjectPath(file.path));
+  const pathSet = new Set(paths);
+  const graph = project.dependencyGraph && Object.keys(project.dependencyGraph).length
+    ? project.dependencyGraph
+    : runStaticValidation(files).graph;
+  const evidenceText = [runtimeOutput, runtimeEvidence.message, runtimeEvidence.stack, runtimeEvidence.source, ...(runtimeEvidence.serverLogs || [])].filter(Boolean).join('\n');
+  const selected = new Set();
+  const add = (filePath) => { if (pathSet.has(filePath) && selected.size < maxTargets) selected.add(filePath); };
+
+  for (const filePath of paths) {
+    const basename = path.posix.basename(filePath);
+    if (evidenceText.includes(filePath) || (basename.length > 3 && evidenceText.includes(basename))) add(filePath);
+  }
+  for (const changed of [...(runtimeEvidence.lastChangedFiles || []), ...(project.lastChangedFiles || [])]) {
+    try { add(normalizeProjectPath(changed)); } catch {}
+  }
+
+  const symbols = extractRuntimeSymbols(evidenceText);
+  for (const file of files) {
+    const filePath = normalizeProjectPath(file.path);
+    const node = graph[filePath] || {};
+    const indexedSymbols = [...(node.exports || []), ...(node.localFunctions || []), ...(node.renders || []), ...Object.values(node.importedSymbols || {}).flat()];
+    if (symbols.some((symbol) => indexedSymbols.includes(symbol) || new RegExp('\\b' + escapeRegExp(symbol) + '\\b').test(String(file.content || '')))) add(filePath);
+  }
+
+  const route = String(runtimeEvidence.previewPath || '');
+  if (route) {
+    for (const file of files) {
+      if (new RegExp("path\\s*=\\s*['\"]" + escapeRegExp(route) + "['\"]").test(String(file.content || ''))) add(normalizeProjectPath(file.path));
+    }
+  }
+
+  if (!selected.size) {
+    add('src/App.jsx');
+    for (const filePath of paths.filter((filePath) => filePath.startsWith('src/pages/') && /\.jsx$/.test(filePath))) add(filePath);
+  }
+
+  for (const seed of [...selected]) {
+    for (const related of [...(graph[seed]?.imports || []), ...(graph[seed]?.importedBy || [])]) add(related);
+  }
+  return [...selected];
+}
+
+function extractRuntimeSymbols(text) {
+  const values = [];
+  const patterns = [
+    /(?:ReferenceError:\s*)?([A-Za-z_$][\w$]*) is not defined/g,
+    /Cannot access ['\"]([A-Za-z_$][\w$]*)['\"]/g,
+    /<([A-Z][A-Za-z0-9_$]*)>/g,
+    /(?:export|import) named ['\"]?([A-Za-z_$][\w$]*)/g
+  ];
+  for (const pattern of patterns) for (const match of String(text || '').matchAll(pattern)) values.push(match[1]);
+  return [...new Set(values)];
+}
+
+function escapeRegExp(value) { return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 function applyChangesInMemory(files, changes) {
   const map = new Map((files || []).map((file) => [normalizeProjectPath(file.path), { ...file }]));

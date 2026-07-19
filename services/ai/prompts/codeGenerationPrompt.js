@@ -41,6 +41,26 @@ export function buildCodeGenerationPrompt({ specification, blueprint, previousFi
     'Never import a relative module unless that exact file exists in previous files, target files, or the blueprint file list. If you import ./routes/AppRoutes, then src/routes/AppRoutes.jsx must be generated or already present.',
     'Respect dependency order: consume previous files/contracts, but do not redefine upstream responsibilities unless a requested target file requires it.',
     '',
+    'STANDARD IMPLEMENTATION WORKFLOW',
+    'Before returning any file, silently work through these checkpoints. Do not print this reasoning — only the final JSON output should be returned.',
+    '',
+    '1. ARCHITECTURE LOCK',
+    '- Read the stack manifest for this project (router mode, state mode, styling mode, data-fetching mode).',
+    '- Only use APIs that belong to the selected mode. If the manifest says router.mode = browser_router, do not import or render any data-router-only API (createBrowserRouter, RouterProvider, useLoaderData, ScrollRestoration, etc.), even if it would normally be idiomatic React Router usage.',
+    '- Never introduce a second instance of an app-wide singleton (router, store, QueryClient, top-level provider) if one already exists upstream in the file tree you were given.',
+    '',
+    '2. DEPENDENCY RESOLUTION',
+    '- For every import in the files you write, confirm the symbol is either: (a) exported by a file you were given as context, (b) exported by a file you are creating in this same batch, or (c) exported by a declared package.json dependency.',
+    '- If none of these hold, do not invent the import — either implement the symbol yourself in-file or omit the feature and note it in "warnings".',
+    '',
+    '3. PROVIDER/CONTEXT CHECK',
+    '- For every hook or component you use that requires a provider (router context, store context, query client, theme/auth context), confirm the component tree you are generating renders beneath that provider.',
+    '- If you cannot confirm the provider exists upstream, do not use the API — pick the simplest form that does not need one.',
+    '',
+    '4. COMPLETENESS CHECK',
+    '- Every interactive element (button, form, input, link) has a working handler or navigation — no decorative dead controls, no TODOs.',
+    '- Every file is returned once, in full, at its exact target path.',
+    '',
     'Specification:',
     JSON.stringify(specification, null, 2),
     '',
@@ -94,7 +114,7 @@ function prioritizePreviousFiles(files = [], targetFiles = [], blueprint = {}) {
       directDependencies.add('src/components/AppShell.jsx');
       directDependencies.add('src/data/mockData.js');
     }
-  }
+  } 
 
   const scored = (files || []).map((file, index) => {
     const path = String(file.path || '');
@@ -106,3 +126,74 @@ function prioritizePreviousFiles(files = [], targetFiles = [], blueprint = {}) {
   });
   return scored.sort((a, b) => b.score - a.score || a.index - b.index).map((item) => item.file);
 }
+
+
+
+/**
+ * 
+ 'You are ' + (agentName || 'Code Generation Agent') + ', generating complete files for a frontend-only React Vite application.',
+    '',
+    'Return strict JSON only. Do not include Markdown fences.',
+    '',
+    'Current dependency-ordered phase: ' + (phase || 'code_generation'),
+    '',
+    'Frontend Manager DAG:',
+    '- Frontend Manager Agent orchestrates all phases.',
+    '- Project Setup Agent creates React/Vite/Tailwind foundation.',
+    '- Component Agent builds shared components and reusable contracts.',
+    '- Layout Agent consumes registered components to build shell/navigation/routing.',
+    '- Page Agent and Styling Agent may run concurrently after layout because they only consume registered components/layouts/tokens.',
+    '- Final integration assembles React project files.',
+    '',
+    'Allowed generated project stack:',
+    '- React.js with Vite',
+    '- JavaScript',
+    '- Tailwind CSS',
+    '- React Router when useful',
+    '- Redux Toolkit only when useful',
+    '- Lucide React',
+    '- localStorage',
+    '- Mock data',
+    '- Safe browser-compatible npm packages when they materially implement the requested UI behavior',
+    '- Frontend-only mock flows for payments, auth, uploads, email, maps, analytics, or third-party integrations unless the package is already in the allowed stack',
+    '',
+    'Disallowed: Express, MongoDB, Mongoose, SQL, authentication, JWT, OAuth, Docker, Next.js, server routes, server-only secrets.',
+    'You may add a browser-compatible npm dependency when it is needed for the requested UI. Add it to package.json and import it normally. Never add server frameworks, databases, server auth packages, lifecycle scripts, Git/URL dependencies, or packages that require secrets.',
+    '',
+    'Return this exact JSON shape:',
+    '{ "files": [{ "path": "src/components/Header.jsx", "language": "jsx", "content": "complete file content" }], "contracts": [], "warnings": [] }',
+    '',
+    'Generate only the requested target files. Preserve exact paths. Return complete working file contents. Do not use placeholder comments or TODO-only code. Ensure imports refer to generated or existing files.',
+    'Return exactly one complete version of each target file. Never duplicate imports, declarations, exports, routes, or file paths.',
+    'Implement the specification and blueprint literally: requested sections, workflows, interactions, data, and design direction must appear in the UI.',
+    'Use the supplied previous file contents as authoritative contracts. Do not invent exports, prop names, aliases, or alternate folders.',
+    'Only src/App.jsx integrates routes and only src/main.jsx mounts React. Do not create another router or application entry.',
+    'Before returning, verify every rendered component is imported or declared and every imported symbol is exported by its real module.',
+    'Never import a relative module unless that exact file exists in previous files, target files, or the blueprint file list. If you import ./routes/AppRoutes, then src/routes/AppRoutes.jsx must be generated or already present.',
+    'Respect dependency order: consume previous files/contracts, but do not redefine upstream responsibilities unless a requested target file requires it.',
+    '',
+    'Specification:',
+    JSON.stringify(specification, null, 2),
+    '',
+    'Blueprint:',
+    JSON.stringify(blueprint, null, 2),
+    '',
+    'Previously generated files:',
+    JSON.stringify(buildPreviousFileContext(previousFiles, targetFiles, blueprint), null, 2),
+    '',
+    'Target files:',
+    JSON.stringify(targetFiles, null, 2),
+    '',
+    'Registered contracts:',
+    JSON.stringify(contracts || [], null, 2),
+    '',
+    'Dependency context:',
+    JSON.stringify(dependencyContext || {}, null, 2),
+    '',
+    'Known pitfalls to avoid from verified fix memory:',
+    dependencyContext?.knownPitfalls || 'No verified pitfalls matched this context.',
+    '',
+    'Previous warnings:',
+    JSON.stringify(warnings || [], null, 2)
+  ].join('\n');
+ */

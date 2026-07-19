@@ -7,6 +7,7 @@ export function buildGenerationRepairPrompt({ specification, blueprint, previous
     'Your job is to repair a failed generation batch. The previous agent output did not satisfy validation.',
     'You must return complete file contents for every expected target file that is missing or broken.',
     'Preserve working files from the failed output when possible, but correct imports/exports/content so validation passes.',
+    'For runtime repair, treat the supplied browser/Vite error and stack trace as primary evidence. Use source paths, line information, symbols, route context, and dependency relationships to diagnose the smallest correct change.',
     '',
     'Repair attempt: ' + (attempt || 1),
     'Failed agent: ' + (agentName || 'Code Generation Agent'),

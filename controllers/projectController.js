@@ -354,7 +354,11 @@ export async function fixProject(req, res, next) {
     const project = await findVisitorProject(req.params.projectId, req.visitorId);
     project.operationStatus = 'fixing';
     await project.save();
-    const result = await runFixLoop(project, { runtimeOutput: String(req.body.runtimeOutput || ''), maxAttempts: 3 });
+    const result = await runFixLoop(project, {
+      runtimeOutput: String(req.body.runtimeOutput || ''),
+      runtimeEvidence: req.body.runtimeEvidence && typeof req.body.runtimeEvidence === 'object' ? req.body.runtimeEvidence : {},
+      maxAttempts: 3
+    });
     res.json({ project: serializeProject(project), result });
   } catch (error) { next(error); }
 }

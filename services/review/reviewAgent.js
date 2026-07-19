@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { runStaticValidation } from './staticValidation.js';
 import { runSmokeRenderTests } from './testingAgent.js';
 
-export async function runQualityReview({ project, runtimeOutput = '', attempt = 1, changedFiles = null }) {
+export async function runQualityReview({ project, runtimeOutput = '', runtimeEvidence = {}, attempt = 1, changedFiles = null }) {
   const staticValidation = runStaticValidation(project.generatedFiles || []);
   const smokeRenderTest = runSmokeRenderTests(project.generatedFiles || []);
   const findings = [];
@@ -23,7 +23,7 @@ export async function runQualityReview({ project, runtimeOutput = '', attempt = 
   return {
     reviewId: randomUUID(), attempt, status, summary, findings,
     filesNeedingChanges: [...new Set(findings.flatMap((finding) => [finding.file, ...(finding.relatedFiles || [])]).filter(Boolean))],
-    verificationCommands: ['npm run build', 'smoke render test'], staticValidation: { ...staticValidation, smokeRenderTest }, runtimeOutput, createdAt: new Date()
+    verificationCommands: ['npm run build', 'smoke render test'], staticValidation: { ...staticValidation, smokeRenderTest }, runtimeOutput, runtimeEvidence, createdAt: new Date()
   };
 }
 

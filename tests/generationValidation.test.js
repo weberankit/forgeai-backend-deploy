@@ -7,6 +7,20 @@ import { buildAgentExecutionStages, buildGenerationBatches } from '../services/g
 import { validateGenerationBatch } from '../services/generation/generatedFileValidation.js';
 import { validateRouteIntegration } from '../services/review/routeValidation.js';
 import { expandSpecification, planFrontendProject } from '../services/ai/aiClient.js';
+import { buildCodeGenerationPrompt } from '../services/ai/prompts/codeGenerationPrompt.js';
+
+test('code generation prompt preserves the standard implementation workflow', () => {
+  const prompt = buildCodeGenerationPrompt({
+    specification: {}, blueprint: {}, previousFiles: [], targetFiles: ['src/App.jsx'], contracts: [], warnings: [], dependencyContext: {}
+  });
+  assert.match(prompt, /STANDARD IMPLEMENTATION WORKFLOW/);
+  assert.match(prompt, /1\. ARCHITECTURE LOCK/);
+  assert.match(prompt, /2\. DEPENDENCY RESOLUTION/);
+  assert.match(prompt, /3\. PROVIDER\/CONTEXT CHECK/);
+  assert.match(prompt, /4\. COMPLETENESS CHECK/);
+  assert.match(prompt, /ScrollRestoration/);
+  assert.match(prompt, /only the final JSON output should be returned/);
+});
 
 test('deterministically removes duplicate declarations and redundant named exports', () => {
   const source = "export const categories = [];\nexport const categories = [];\nexport { categories };\n";
@@ -232,4 +246,3 @@ export const selectOtherBatSelector = (state) => state.bats.other;
   assert.equal(validateProjectSymbols(result.files).passed, true);
   assert.ok(result.repairs.some((repair) => repair.code === 'DUPLICATE_DECLARATION'));
 });
-

@@ -1,765 +1,535 @@
-# ForgeAI Backend — Architecture & Generation Pipeline
+# AI ForeMan Frontend Software Engineer — Backend
 
-This document describes how a user prompt turns into a running, previewable React application inside ForgeAI: the request pipeline, the file-generation batching system, and the multi-layer repair system that keeps generated code valid.
+Node.js + Express + MongoDB backend for a platform that turns a text prompt or UI sketch into a frontend-only React application specification, blueprint, and generated implementation.
 
----
+## Repository Layout
 
-## Table of Contents
+The frontend and backend are intentionally separated. There is no root npm workspace and no root `node_modules`. Install dependencies inside each app folder.
 
-- [High-Level Pipeline](#high-level-pipeline)
-- [Stage-by-Stage Flow](#stage-by-stage-flow)
-  1. [User Presses Send](#1-user-presses-send)
-  2. [Frontend Sends the Expansion Request](#2-frontend-sends-the-expansion-request)
-  3. [Express Routes the Request](#3-express-routes-the-request)
-  4. [Backend Expands the Prompt](#4-backend-expands-the-prompt)
-  5. [Clarification Branch](#5-clarification-branch)
-  6. [Blueprint Creation](#6-blueprint-creation)
-  7. [Blueprint Approval](#7-blueprint-approval)
-  8. [Start File Generation](#8-start-file-generation)
-  9. [Generate Files in Batches](#9-generate-files-in-batches)
-  10. [One Generation Batch](#10-one-generation-batch)
-  11. [Repair & Validation](#11-repair--validation)
-  12. [Whole-Project Validation](#12-whole-project-validation)
-  13. [Load Files into the Browser](#13-load-generated-files-into-the-browser)
-- [Repair System (Deep Dive)](#repair-system-deep-dive)
-- [Full Function Call Chain](#full-function-call-chain)
-- [Key Files Reference](#key-files-reference)
-
----
-
-## High-Level Pipeline
-
-```mermaid
-flowchart TD
-    A[Prompt submission] --> B[Expand prompt into specification]
-    B --> C{Blocking questions?}
-    C -- Yes --> D[Ask clarifying questions] --> B
-    C -- No --> E[Create implementation blueprint]
-    E --> F[Auto-approve blueprint]
-    F --> G[Generate files in batches]
-    G --> H[Repair & validate generated code]
-    H --> I[Store files in MongoDB]
-    I --> J[Write files into browser WebContainer]
-    J --> K[npm install]
-    K --> L[Start Vite dev server]
-    L --> M[Display live preview]
+```text
+client/   Vite React frontend
+server/   Express + MongoDB backend
 ```
 
-Every stage below maps directly onto one node in this diagram.
+## Stack
 
----
+- Node.js
+- Express.js
+- MongoDB
+- Mongoose
 
-## Stage-by-Stage Flow
-
-### 1. User Presses Send
-
-**File:** `forgeai-frontend/src/components/ChatWorkspace.jsx:353`
-
-```js
-const submit = async (event) => {
-  event.preventDefault();
-  const text = prompt.trim();
-  const activeChatId = await ensureChat();
-
-  await dispatch(addUserMessage({ chatId: activeChatId, content: text })).unwrap();
-
-  const expanded = await dispatch(
-    expandProjectStream({ chatId: activeChatId, prompt: text })
-  ).unwrap();
-};
-```
-
-Call chain:
-
-```
-submit()
-  → ensureChat()
-  → addUserMessage()
-  → expandProjectStream()
-```
-
-> **Branch (line 362):** `if (approved && project.generatedFiles.length)` — if an app was already generated in this chat, the new message is treated as an **edit/explanation request**, not a fresh generation.
-
----
-
-### 2. Frontend Sends the Expansion Request
-
-**File:** `forgeai-frontend/src/services/apiClient.js:104`
-
-```js
-expandProjectStream: ({ chatId, prompt, image, onToken }) => {
-  const formData = new FormData();
-  formData.set('chatId', chatId);
-  formData.set('prompt', prompt);
-
-  return streamRequest(
-    '/api/projects/expand/stream',
-    { method: 'POST', body: formData },
-    { onToken }
-  );
-}
-```
-
-```
-POST /api/projects/expand/stream
-Content-Type: multipart/form-data
-```
-
-Uses **SSE (Server-Sent Events)** so the backend can stream progress/tokens back to the UI as it works.
-
----
-
-### 3. Express Routes the Request
-
-**File:** `forgeai-backend/routes/projectRoutes.js:34`
-
-```js
-router.post('/expand/stream', uploadImage.single('image'), expandProjectStream);
-```
-
-Mounted in `forgeai-backend/app.js:21`:
-
-```js
-app.use('/api/projects', projectRoutes);
-```
-
-Full endpoint: `/api/projects` + `/expand/stream` = **`/api/projects/expand/stream`**
-
-Middleware chain before the controller:
-
-```
-Express
-  → JSON / CORS / activity middleware
-  → projectRoutes
-  → requireVisitor middleware
-  → uploadImage.single("image")
-  → expandProjectStream controller
-```
-
----
-
-### 4. Backend Expands the Prompt
-
-**File:** `forgeai-backend/controllers/projectController.js:51`
-
-```js
-export async function expandProjectStream(req, res) {
-  startSse(res);
-
-  const chatId = String(req.body.chatId || '').trim();
-  const prompt = String(req.body.prompt || '').trim();
-
-  const chat = await findVisitorChat(chatId, req.visitorId);
-  const imageDescription = await describeImage(req.file);
-
-  const expandedSpec = await expandSpecification({ prompt, imageDescription, onToken });
-
-  const project = await Project.create({
-    projectId: randomUUID(),
-    originalPrompt: prompt,
-    expandedSpec,
-    status: 'spec_ready'
-  });
-
-  writeSse(res, 'final', { project });
-}
-```
-
-This stage:
-1. Validates the prompt and visitor.
-2. Converts the raw prompt into a **detailed specification**.
-3. Creates a `Project` database record.
-
-Call chain:
-
-```
-expandProjectStream()
-  → expandSpecification()
-  → runExpansionGraph()
-  → expansionNode()
-  → buildExpansionPrompt()
-  → callStructuredAgent()
-  → callOpenAI()
-  → fetchLlmResponse()
-```
-
-**`expandSpecification()`** — `forgeai-backend/services/ai/aiClient.js:3`
-
-```js
-export async function expandSpecification({ prompt, imageDescription, onToken }) {
-  return runExpansionGraph({
-    prompt,
-    imageDescription,
-    fallback: mockExpansion(prompt, imageDescription),
-    onToken
-  });
-}
-```
-
-**LangGraph definition** — `forgeai-backend/services/ai/langGraphAgent.js:40`
-
-```
-START → expansion_agent → END
-```
-
-The LLM returns a structured specification containing:
-
-- `projectName`, `projectSummary`
-- `pages`, `coreFeatures`
-- `dataRequirements`
-- `assumptions`, `blockingQuestions`
-
-> If OpenAI is disabled or its response fails validation, `mockExpansion()` provides a local, deterministic fallback so the pipeline never hard-fails at this stage.
-
----
-
-### 5. Clarification Branch
-
-Back in `submit()`:
-
-```js
-const questions = blockingQuestionsFrom(expanded.project);
-
-if (questions.length) {
-  addClarificationQuestion(...);
-  return;
-}
-```
-
-**File:** `forgeai-frontend/src/components/ChatWorkspace.jsx:421`
-
-```
-Expanded specification
-        |
-        ├─ has blocking questions
-        │    → show questions
-        │    → user answers
-        │    → answerClarification()
-        │    → expandProjectStream() again
-        │
-        └─ no blocking questions
-             → continueToPlanning()
-```
-
-When all clarification answers are collected, `answerClarification()` merges them with the original prompt and re-runs specification expansion.
-
----
-
-### 6. Blueprint Creation
-
-```js
-await continueToPlanning(expanded.project, '');
-```
-
-```js
-dispatch(planProjectStream({
-  projectId: planningProject.projectId,
-  specification: planningProject.expandedSpec,
-  clarification
-}))
-```
-
-```
-POST /api/projects/plan/stream
-```
-
-```js
-const blueprint = await planFrontendProject({ specification, clarification, onToken });
-```
-
-Full chain:
-
-```
-continueToPlanning()
-  → planProjectStream (Redux thunk)
-  → apiClient.planProjectStream()
-  → POST /api/projects/plan/stream
-  → controller planProjectStream()
-  → planFrontendProject()
-  → runPlanningGraph()
-  → planningNode()
-  → buildPlanningPrompt()
-  → callStructuredAgent()
-  → OpenAI / fallback
-```
-
-The resulting **blueprint** describes: exact file list, pages, components, dependencies, generation phases, and acceptance criteria.
-
-```js
-project.blueprint = blueprint;
-project.status = 'planned';
-await project.save();
-```
-
----
-
-### 7. Blueprint Approval
-
-The current frontend **auto-approves** the blueprint — there is no manual pause by default:
-
-```js
-if (planned.project?.approvalStatus !== 'approved') {
-  const approvedProject = await dispatch(updateApproval({
-    projectId: planned.project.projectId,
-    approvalStatus: 'approved'
-  })).unwrap();
-
-  await runGeneration(approvedProject.project.projectId);
-}
-```
-
-```
-PATCH /api/projects/:projectId/approval
-```
-
-> Approval-related UI/functions exist in the codebase, but the default initial flow does not pause for manual review.
-
----
-
-### 8. Start File Generation
-
-**File:** `forgeai-frontend/src/components/ChatWorkspace.jsx:479`
-
-```js
-await dispatch(generateProjectStream({
-  projectId,
-  onFiles: ({ generationProgress, currentBatch }) => {
-    // update progress display
-  }
-})).unwrap();
-```
-
-```
-POST /api/projects/:projectId/generate/stream
-```
-
-```js
-router.post('/:projectId/generate/stream', generateProjectStream);
-```
-
-```js
-const generated = await generateProjectFiles(project, {
-  onFiles: async (files, current) => {
-    writeSse(res, 'files', {
-      files,
-      generationStatus: current.generationStatus,
-      generationProgress: current.generationProgress,
-      currentBatch: current.currentBatch
-    });
-  }
-});
-```
-
----
-
-### 9. Generate Files in Batches
-
-**File:** `forgeai-backend/services/generation/codeGenerationService.js:17`
-
-```js
-export async function generateProjectFiles(project, options = {})
-```
-
-```
-generateProjectFiles()
-  → buildGenerationBatches()
-  → buildProjectManifest()
-  → buildAgentExecutionStages()
-  → runGenerationBatch()   [for every batch]
-  → repairGenerationBatch()
-  → commitGeneratedFiles()
-  → final project validation
-  → save project
-```
-
-```js
-const batches = buildGenerationBatches(project.blueprint || {});
-const manifest = buildProjectManifest(project.blueprint || {}, batches);
-const stages = buildAgentExecutionStages(batches);
-```
-
-Typical batch layout:
-
-| Batch | Contents |
-|---|---|
-| 1 | `package.json`, Vite / Tailwind configuration |
-| 2 | Mock data and shared utilities |
-| 3 | Reusable UI components |
-| 4 | Layout and navigation |
-| 5 | Pages |
-| 6 | `App.jsx` and `main.jsx` integration |
-
-Independent batches can run **concurrently**; dependent batches run **sequentially**, based on the dependency graph produced during planning.
-
----
-
-### 10. One Generation Batch
-
-```
-runGenerationBatch()
-  → retrieveVerifiedFixes()
-  → mockGenerateBatch()          [fallback]
-  → runCodeGenerationGraph()
-  → codeGenerationNode()
-  → buildCodeGenerationPrompt()
-  → callStructuredAgent()
-  → OpenAI
-```
-
-The generation prompt receives:
-
-- Expanded specification
-- Blueprint
-- Previously generated files
-- Current target file paths
-- Contracts between batches
-- Warnings
-- Dependency context
-- Known previous pitfalls
-- Project manifest
-
-Expected model output:
-
-```json
-{
-  "files": [
-    { "path": "src/App.jsx", "content": "...complete source code..." }
-  ],
-  "contracts": [],
-  "warnings": []
-}
-```
-
-Files outside the assigned batch are discarded:
-
-```js
-generated.files = returnedFiles.filter((file) =>
-  assigned.has(normalizeProjectPath(file.path))
-);
-```
-
-This prevents one generation agent from unexpectedly overwriting another agent's files.
-
----
-
-### 11. Repair & Validation
-
-Every batch passes through `repairGenerationBatch(...)`:
-
-```
-runDeterministicRepairs()
-  → repairMissingRelativeImports()
-  → runDeterministicRepairs()      [again]
-  → validateGenerationBatch()
-  → validateBatchGraph()
-```
-
-If validation still fails:
-
-```
-runGenerationRepairGraph()
-  → generationRepairNode()
-  → buildGenerationRepairPrompt()
-  → OpenAI repair response
-  → validate again
-```
-
-Retries up to **3 attempts**.
-
-After a valid batch, `commitGeneratedFiles()`:
-
-- Merges new files with existing files
-- Repairs imports
-- Performs static validation
-- Updates the dependency graph
-- Saves `generatedFiles` to the `Project`
-- Streams changed files/progress to the frontend
-
----
-
-### 12. Whole-Project Validation
-
-After all batches complete:
-
-```js
-project.generatedFiles = repairProjectFiles(...);
-validateGeneratedFiles(project.generatedFiles);
-project.dependencyGraph = runStaticValidation(...).graph;
-
-let smokeRenderTest = runSmokeRenderTests(...);
-```
-
-If the smoke/render test fails:
-
-```js
-await runFixLoop(project, {
-  runtimeOutput: 'Smoke/render test failed...',
-  maxAttempts: 3
-});
-```
-
-Status progression:
-
-```
-preparing → generating_batch → validating → storing → ready_for_preview
-```
-
-On unrecoverable failure, the last known-good state is restored:
-
-```js
-project.generationStatus = 'failed';
-project.generationError = error.message;
-// project.generatedFiles reverts to lastValidProjectFiles
-```
-
----
-
-### 13. Load Generated Files into the Browser
-
-```js
-const snapshot = await dispatch(fetchProject(projectId)).unwrap();
-await writeGeneratedFiles(snapshot.project.generatedFiles);
-```
-
-**File:** `forgeai-frontend/src/components/ChatWorkspace.jsx:486`
-**Function:** `forgeai-frontend/src/services/progressiveWebContainerService.js:13`
-
-```
-writeGeneratedFiles()
-  → preparePreviewEnvironment()
-  → setup()
-  → boot()
-  → getWebContainer()
-  → mount base React/Vite template
-  → validate generated file paths
-  → validate required files
-  → validate relative imports
-  → write files into WebContainer filesystem
-  → sanitize package.json
-  → npm install --ignore-scripts
-  → optionally npm run build
-  → npm run dev -- --host 0.0.0.0
-  → wait for WebContainer server-ready
-  → return preview URL
-```
-
-Required generated files:
-
-```
-package.json
-index.html
-src/main.jsx
-src/App.jsx
-src/index.css
-```
-
-The browser-side WebContainer runs:
+## Setup
 
 ```bash
-npm install --ignore-scripts
-npm run dev -- --host 0.0.0.0
+cd server
+npm install
+cp .env.example .env
+npm run dev
 ```
 
-When Vite emits **server-ready**, the preview URL is stored and rendered by `PreviewPanel`.
+MongoDB must be running before the backend can stay up.
 
----
+### Environment Variables
 
-## Repair System (Deep Dive)
-
-There are effectively **two AI repair systems**, plus deterministic repairs on either side of them:
-
-```mermaid
-flowchart TD
-    A[Generated batch] --> B[Deterministic repair]
-    B --> C[Import repair]
-    C --> D[Validation]
-    D -->|invalid| E[AI Generation Repair Agent]
-    E --> D
-    D -->|valid, all batches done| F[Whole-app smoke test]
-    F -->|fail| G[Fix Agent]
-    G --> F
-    F -->|pass| H[Browser build - WebContainer/Vite]
-    H -->|build/runtime error| I[Automatic preview fix]
-    I --> H
-    H -->|success| J[Live preview]
+```env
+PORT=4000
+MONGODB_URI=mongodb://127.0.0.1:27017/ai_frontend_engineer
+CLIENT_ORIGIN=http://localhost:5173
+AI_PROVIDER=mock
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4.1-mini
+VISION_PROVIDER=mock
+MAX_IMAGE_SIZE_MB=5
+DEMO_MODE=false
+DEPLOY_PROVIDER=mock
+VERCEL_TOKEN=
+VERCEL_TEAM_ID=
 ```
 
-### 1. Deterministic Repairs
+`AI_PROVIDER=mock` is the default, so the app runs without an API key. Set `AI_PROVIDER=openai` and provide `OPENAI_API_KEY` to use real generation.
 
-**File:** `forgeai-backend/services/generation/codeGenerationService.js:173`
+## Visitor Continuity
 
-```js
-runDeterministicRepairs(...)
-repairMissingRelativeImports(...)
-runDeterministicRepairs(...)
+There is no authentication. The browser generates a UUID with `crypto.randomUUID()` and stores it in `localStorage` under `ai_frontend_engineer_visitor_id`. The frontend sends it on every request as the `x-visitor-id` header. Chats and projects are stored by `visitorId`.
+
+## API Routes
+
+### Chats
+
+```text
+POST   /api/chats
+GET    /api/chats
+GET    /api/chats/:chatId
+POST   /api/chats/:chatId/messages
 ```
 
-Rule-based, no LLM involved. Fixes predictable issues: missing routes, integration mistakes, broken relative imports.
+### Projects
 
-### 2. AI Generation Repair Agent
-
-If a batch still fails validation after deterministic repair:
-
-```js
-runGenerationRepairGraph(...)
+```text
+POST   /api/projects/expand
+POST   /api/projects/plan
+GET    /api/projects/:projectId
+GET    /api/projects/:projectId/files
+PATCH  /api/projects/:projectId/files
+POST   /api/projects/:projectId/generate
+POST   /api/projects/:projectId/regenerate
+PATCH  /api/projects/:projectId/approval
+POST   /api/projects/:projectId/review
+POST   /api/projects/:projectId/fix
+POST   /api/projects/:projectId/edit
+GET    /api/projects/:projectId/reviews
+GET    /api/projects/:projectId/dependency-graph
+POST   /api/projects/:projectId/restore
+POST   /api/projects/:projectId/explain
+POST   /api/projects/:projectId/deploy
+GET    /api/projects/:projectId/deployments
+GET    /api/projects/deployments/:deploymentId/status
+GET    /api/projects/memory/verified-fixes
 ```
 
-**Graph:** `forgeai-backend/services/ai/langGraphAgent.js:61`
+### Health
 
-```
-START → generation_repair_agent → END
-```
-
-Receives:
-- Generated files that failed
-- Validation error
-- Target file list
-- Previously generated files
-- Blueprint and specification
-- Import/dependency context
-
-Retries up to 3 times:
-
-```js
-for (let attempt = 1; attempt <= maxAttempts; attempt += 1)
+```text
+GET    /api/health
 ```
 
-### 3. Whole-Project Fix Agent
+## Core Product Flow
 
-Runs once all batches are assembled:
-
-```js
-let smokeRenderTest = runSmokeRenderTests(project.generatedFiles);
-
-if (!smokeRenderTest.passed) {
-  await runFixLoop(project, {
-    runtimeOutput: 'Smoke/render test failed...',
-    maxAttempts: 3
-  });
-}
+```text
+visitor opens app
+  -> browser creates/stores UUID in localStorage
+  -> frontend sends UUID as x-visitor-id
+  -> user creates a chat and submits a prompt or image
+  -> backend stores chat/project under visitorId
+  -> expansion agent creates a frontend-only specification
+  -> planning agent creates an implementation blueprint
+  -> user approves the blueprint
+  -> generation creates dependency-ordered React/Vite files
+  -> files are stored on Project.generatedFiles
+  -> frontend displays a file tree and code viewer
+  -> WebContainer mounts the files
+  -> WebContainer runs npm install, then npm run dev -- --host 0.0.0.0
+  -> preview iframe loads the generated app
+  -> review, fix, edit, explain, and deploy operate on the persisted files
 ```
 
-**Implementation:** `forgeai-backend/services/review/fixAgent.js`
+## AI / Agent Orchestration
 
-### 4. Browser-Preview Automatic Fix
+LLM orchestration is LangGraph-based. Primary file:
 
-Even after backend checks pass, Vite can surface a real build/runtime error in the WebContainer. The frontend catches this:
-
-```js
-try {
-  await writeGeneratedFiles(files);
-} catch (previewError) {
-  await requestAutomaticPreviewFix(buildError);
-}
+```text
+server/services/ai/langGraphAgent.js
 ```
 
-**File:** `forgeai-frontend/src/components/ChatWorkspace.jsx:489`
+Graph-backed stages:
 
-The actual WebContainer/Vite error is sent back for another repair attempt.
+- `expansion_agent` — prompt/image to specification
+- `planning_agent` — specification to blueprint
+- `code_generation_agent` — dependency-batched file generation
 
-### If All Repairs Fail
+Public service calls route through LangGraph:
 
-The last known-good state is preserved — a broken batch never silently overwrites a working project:
-
-```js
-project.generatedFiles = lastValidProjectFiles;
-project.generationStatus = 'failed';
-project.generationError = error.message;
+```text
+expandSpecification()   -> runExpansionGraph()
+planFrontendProject()    -> runPlanningGraph()
+generateProjectFiles()   -> runCodeGenerationGraph() (per batch)
 ```
 
-### Summary Table
+With `AI_PROVIDER=openai`, LangGraph nodes call the OpenAI API and validate structured JSON output, retrying once on invalid output.
 
-| Layer | Type | Trigger | Max Attempts | Scope |
-|---|---|---|---|---|
-| Deterministic repair | Rule-based | Every batch | N/A (always runs) | Single batch |
-| Generation Repair Agent | AI (LangGraph) | Batch fails validation | 3 | Single batch |
-| Fix Agent | AI | Whole-app smoke test fails | 3 | Whole project |
-| Automatic preview fix | AI | WebContainer/Vite build error | Backend-driven | Whole project |
+### LangGraph State Graph Structure
 
----
+The core build pipeline (`runExpansionGraph` / `runPlanningGraph` /
+`runCodeGenerationGraph`) is not one monolithic graph — it is three
+separate compiled StateGraphs, invoked in sequence by the controller layer,
+each with its own internal nodes/edges and conditional routing. The edit/
+explain/review/fix/deploy agents are separate services invoked directly
+from `projectController.js` on their own routes, not nodes inside these
+three graphs.
 
-## Full Function Call Chain
+**1. Expansion Graph**
 
-The complete, successful end-to-end call chain:
-
-```
-ChatWorkspace.submit()
-→ ensureChat()
-→ addUserMessage()
-→ expandProjectStream()
-→ POST /api/projects/expand/stream
-→ projectController.expandProjectStream()
-→ expandSpecification()
-→ runExpansionGraph()
-→ expansionNode()
-→ callStructuredAgent()
-→ callOpenAI()
-
-→ ChatWorkspace.continueToPlanning()
-→ planProjectStream()
-→ POST /api/projects/plan/stream
-→ projectController.planProjectStream()
-→ planFrontendProject()
-→ runPlanningGraph()
-→ planningNode()
-→ callStructuredAgent()
-→ callOpenAI()
-
-→ updateApproval()
-→ ChatWorkspace.runGeneration()
-→ generateProjectStream()
-→ POST /api/projects/:id/generate/stream
-→ projectController.generateProjectStream()
-→ generateProjectFiles()
-→ buildGenerationBatches()
-→ buildAgentExecutionStages()
-→ runGenerationBatch()
-→ runCodeGenerationGraph()
-→ codeGenerationNode()
-→ callStructuredAgent()
-→ callOpenAI()
-→ repairGenerationBatch()
-→ commitGeneratedFiles()
-→ validateGeneratedFiles()
-→ runStaticValidation()
-→ runSmokeRenderTests()
-→ project.save()
-
-→ fetchProject()
-→ writeGeneratedFiles()
-→ preparePreviewEnvironment()
-→ WebContainer.boot()
-→ wc.mount()
-→ wc.fs.writeFile()
-→ npm install
-→ npm run dev
-→ server-ready
-→ PreviewPanel
+```text
+START
+  │
+  ▼
+expansion_agent
+  (calls OpenAI/mock, produces structured spec JSON,
+   validates against schema, retries once on invalid JSON)
+  │
+  ▼
+[conditional edge] blockingQuestions.length > 0 ?
+  │                              │
+  ▼ yes                          ▼ no
+awaiting_clarification         END
+  │  (graph pauses here -            (spec is complete,
+  │   returns to controller,          returned as-is)
+  │   which surfaces ONE
+  │   question at a time via
+  │   the chat API)
+  │
+  ▼ (user answers -> controller
+     re-invokes the graph with
+     the original input + the
+     new answer appended)
+  │
+  └──────────────► back to expansion_agent
+                   (re-runs with additional context; loop continues
+                   until blockingQuestions is empty)
 ```
 
----
+**2. Planning Graph**
 
-## Key Files Reference
+```text
+START
+  │
+  ▼
+planning_agent
+  (calls OpenAI/mock, takes the finalized spec from the
+   Expansion Graph, produces the blueprint JSON: folder
+   structure, data models, API routes, Redux slices, file
+   list with dependsOn/order, implementation phases)
+  │
+  ▼
+validate_blueprint
+  (checks: every file path unique, every dependsOn resolves
+   to a planned file or an installed package, no cycles)
+  │
+  ▼
+[conditional edge] validation passed?
+  │                       │
+  ▼ yes                   ▼ no
+END                    planning_agent
+(blueprint returned    (re-run once with the validation
+ to controller for      errors appended as correction
+ human approval)         context, then END regardless of
+                         outcome on the retry - surfaced to
+                         review/approval either way)
+```
 
-| File | Responsibility |
-|---|---|
-| `forgeai-frontend/src/components/ChatWorkspace.jsx` | Orchestrates the entire client-side flow: submit, clarification, planning, generation, preview |
-| `forgeai-frontend/src/services/apiClient.js` | All backend API calls (expand/plan/generate/approval) |
-| `forgeai-frontend/src/services/progressiveWebContainerService.js` | Boots the browser WebContainer and runs the generated app |
-| `forgeai-backend/app.js` | Express app setup and route mounting |
-| `forgeai-backend/routes/projectRoutes.js` | Route definitions for `/api/projects/*` |
-| `forgeai-backend/controllers/projectController.js` | Request handlers: expand, plan, generate, approval |
-| `forgeai-backend/services/ai/aiClient.js` | Entry points into the LangGraph-based AI agents |
-| `forgeai-backend/services/ai/langGraphAgent.js` | LangGraph node/graph definitions (expansion, planning, generation, repair) |
-| `forgeai-backend/services/ai/prompts/*` | Prompt builders: `buildExpansionPrompt`, `buildPlanningPrompt`, `buildCodeGenerationPrompt`, `buildGenerationRepairPrompt` |
-| `forgeai-backend/services/generation/codeGenerationService.js` | Batch building, generation orchestration, deterministic repair, commit logic |
-| `forgeai-backend/services/review/fixAgent.js` | Whole-project Fix Agent (post-assembly repair) |
+**3. Code Generation Graph**
 
----
+```text
+START
+  │
+  ▼
+prepare_batches
+  (topologicalSort.js + generationBatches.js run here as a
+   plain function node - not an LLM call - producing an
+   ordered list of file batches from the approved blueprint)
+  │
+  ▼
+code_generation_agent  ◄─────────────┐
+  (generates complete file contents   │
+   for the CURRENT batch only, given   │
+   existing generated files + any      │
+   registered component/API contracts) │
+  │                                    │
+  ▼                                    │
+validate_batch                         │
+  (generatedFileValidation.js +        │
+   pathSafety.js + packageSafety.js    │
+   run here as function nodes)         │
+  │                                    │
+  ▼                                    │
+[conditional edge] batch valid?        │
+  │                    │               │
+  ▼ yes                ▼ no            │
+persist_batch      code_generation_agent
+  (writes valid       (re-run THIS batch only,
+   files to            with validation errors
+   Project.            appended as correction
+   generatedFiles)      context)
+  │
+  ▼
+[conditional edge] more batches remaining?
+  │                              │
+  ▼ yes                          ▼ no
+  └──────────────────────────►  END
+  (advance to next batch,        (all batches persisted,
+   loop back to                   project status becomes
+   code_generation_agent)         "ready_for_preview")
+```
 
-## Notes / Known Behaviors
+**Why three separate graphs instead of one continuous graph:** each stage
+has a distinct human-in-the-loop checkpoint the controller layer needs to
+own (clarifying questions after expansion, blueprint approval after
+planning) — modeling these as separate compiled graphs invoked by the
+controller keeps each graph's retry/validation logic focused on one
+concern, rather than one large graph with many long-lived conditional
+branches spanning stages that don't actually share state requirements.
 
-- **Auto-approval:** Blueprints are approved automatically in the default flow; manual-approval UI exists but is currently bypassed.
-- **Graceful fallback:** Both expansion and generation have local mock fallbacks (`mockExpansion`, `mockGenerateBatch`) if the LLM is disabled or its response fails validation — the pipeline degrades rather than hard-failing.
-- **Non-destructive failure:** If all repair layers fail, the project keeps its `lastValidProjectFiles` rather than being overwritten with broken output.
-- **File ownership isolation:** Each generation batch can only write files it was explicitly assigned — files outside that set are filtered out before being merged into the project
+### Non-graph agent services
+
+Review, Fix, Edit, Explain, and Deploy are implemented as direct service
+calls (see their dedicated flow sections below) rather than as LangGraph
+nodes — they are invoked individually from `projectController.js` on their
+own REST routes, since each is triggered by an independent user action
+(not a continuous pipeline step), and several of them (staticValidation,
+dependencyGraph, pathSafety, packageSafety) are deterministic
+function-based checks with no LLM call at all.
+
+### Expansion Agent Flow
+
+```text
+raw prompt (or image -> vision description)
+  -> Requirement Expansion Agent (LangGraph node, calls OpenAI/mock)
+  -> infers pages, entities, core features, backend requirement
+  -> returns structured JSON spec (see codeGenerationPrompt.js schema)
+  -> if blockingQuestions is non-empty:
+       -> POST /api/chats/:chatId/messages surfaces one question at a time
+       -> user answers -> expansion agent re-runs with the answer appended
+  -> if blockingQuestions is empty:
+       -> spec is stored on the Project, flow proceeds directly to Planning Agent
+```
+
+### Planning Agent Flow
+
+```text
+approved/expanded specification
+  -> Project Planner Agent (LangGraph node)
+  -> orders work by file dependency (components before pages,
+     models/routes before frontend features that call them)
+  -> produces: folder structure, data models, API routes (if full-stack),
+     Redux slices, file list with "dependsOn" and "order", implementation
+     phases, acceptance criteria
+  -> blueprint stored on Project, returned to frontend for review
+  -> user reviews via ReviewPanels.jsx -> PATCH /api/projects/:projectId/approval
+  -> on approval, flow proceeds automatically to Code Generation Agent
+```
+
+### Code Generation Agent Flow
+
+```text
+approved blueprint + file plan
+  -> topologicalSort.js orders files so dependencies generate first
+  -> generationBatches.js groups files into dependency-safe batches
+  -> for each batch:
+       -> Code Generation Agent (LangGraph node) generates complete file
+          contents for every file in that batch, given: existing generated
+          files, registered component/API contracts, and the target file
+          list for this batch only
+       -> generatedFileValidation.js checks each returned file:
+            - valid JSON shape
+            - no partial files, no placeholder comments
+            - all requested files returned, no extra files returned
+       -> pathSafety.js rejects unsafe paths (../, .env, node_modules, Docker files)
+       -> packageSafety.js rejects disallowed/unlisted packages and any
+          lifecycle install scripts in package.json
+       -> valid files are persisted to Project.generatedFiles in MongoDB
+  -> once all batches complete, project status becomes "ready_for_preview"
+  -> frontend polls/receives updated file tree, WebContainer boots the
+     project (npm install -> npm run dev -- --host 0.0.0.0)
+```
+
+### Review Agent Flow
+
+```text
+POST /api/projects/:projectId/review
+  -> staticValidation.js runs deterministic checks first (syntax, imports,
+     lint-style rules) - cheap and doesn't need an LLM call
+  -> dependencyGraph.js is built/refreshed from current generatedFiles
+     (imports, importedBy, exports, JSX-rendered components, Redux/service
+     imports)
+  -> Review Agent (LangGraph node) reviews the project as a system, using
+     the static validation results + dependency graph + latest build output
+  -> returns structured findings: severity (blocker/high/medium/low),
+     category (build/runtime/product/redux/backend/accessibility/
+     responsive/maintainability), evidence, root cause, recommended change
+  -> status is "failed" if any blocker/high finding exists, else "passed"
+  -> findings persisted, returned to ReviewFindingsPanel.jsx
+```
+
+### Fix (Repair) Agent Flow
+
+```text
+POST /api/projects/:projectId/fix
+  -> reads the latest review findings for the target file(s)
+  -> versioningService.js snapshots the project BEFORE making changes
+  -> Fix Agent (LangGraph node) attempts a targeted fix using the specific
+     finding's evidence and recommendedChange - not a full file rewrite
+     unless the finding requires it
+  -> re-runs Review Agent (static validation + LLM review) on just the
+     changed file(s) to confirm the fix actually resolved the finding
+  -> loop: if still failing, retry (capped at 3 attempts per file)
+  -> attempt 1 fails -> attempt 2 -> attempt 3 -> still failing:
+       -> file is left flagged in filesNeedingChanges, NOT silently
+          treated as fixed
+       -> surfaced back to the user rather than looping indefinitely
+  -> on success: changed file's version increments, snapshot retained for
+     restore, Review Agent findings updated to reflect the resolved state
+```
+
+### Edit Agent Flow
+
+```text
+user sends a natural-language message (e.g. "make the summary cards
+more compact")
+  -> intentRouter.js classifies the message as build / edit / explain / unknown
+  -> if "edit":
+       -> editTargeting.js resolves the request to actual file(s) using
+          the AST dependency graph - looks up components/sections by name
+          and their importedBy relationships, rather than letting the LLM
+          guess file paths
+       -> versioningService.js snapshots the project before applying changes
+       -> Edit Agent (LangGraph node) receives ONLY the resolved target
+          file(s) plus relevant context, and applies the targeted change
+       -> generatedFileValidation.js + pathSafety.js + packageSafety.js
+          re-validate the edited file(s) exactly like fresh generation
+       -> Review Agent re-runs on just the changed file(s)
+       -> changed file(s) version increments, editStatus becomes
+          "preview_ready"
+       -> frontend refreshes the WebContainer mount with the updated
+          file(s) and reloads the preview
+  -> POST /api/projects/:projectId/restore reverts to the latest snapshot
+     if the user wants to undo an edit or a failed fix attempt
+```
+
+### Explain Agent Flow
+
+```text
+user sends a question (e.g. "explain how task filtering works")
+  -> intentRouter.js classifies the message as "explain"
+  -> POST /api/projects/:projectId/explain
+  -> Explain Agent (server/services/explain/explainAgent.js) is grounded
+     in the generated files and the AST dependency graph:
+       -> looks up relevant file(s) via the dependency graph (component
+          registry, importedBy/imports relationships) rather than
+          guessing from the question text alone
+       -> walks the real call chain (e.g. UI component -> state handler
+          -> Redux slice -> any service/API call it touches)
+       -> reads the actual file contents for every file in that chain
+  -> produces a grounded explanation referencing real file names and
+     function names, with referenced files openable directly from the
+     explanation panel (ExplanationPanel.jsx)
+  -> does not execute or simulate UI interactions - it is static-analysis
+     grounded, not a runtime trace
+```
+
+### Deploy Agent Flow
+
+```text
+POST /api/projects/:projectId/deploy
+  -> deploymentService.js checks DEPLOY_PROVIDER
+  -> DEPLOY_PROVIDER=mock (default): creates a demo deployment record,
+     returns a demo://deployment/... URL, clearly labeled as demo mode -
+     no real hosting occurs
+  -> DEPLOY_PROVIDER=<real adapter>: would call the configured provider
+     (e.g. Vercel) using VERCEL_TOKEN / VERCEL_TEAM_ID - not enabled by
+     default, requires adding a production provider adapter
+  -> deployment status persisted, retrievable via
+     GET /api/projects/:projectId/deployments and
+     GET /api/projects/deployments/:deploymentId/status
+```
+
+### Memory (Verified Fix) Flow
+
+```text
+Fix Agent resolves a finding AND Review Agent confirms it's actually
+resolved (not just attempted)
+  -> verifiedFixMemory.js stores a flat record on the VerifiedFix model:
+     { pattern, context, fixApplied, verified: true }
+  -> before future generation/fix attempts on a similar pattern, keyword
+     retrieval (GET /api/projects/memory/verified-fixes) surfaces past
+     verified fixes as "known pitfalls to avoid" context
+  -> retrieval is keyword-based in the current implementation, not vector/
+     embedding-based
+```
+
+## Generation
+
+```text
+approved blueprint
+  -> dependency-aware generation batches
+  -> generated React/Vite files
+  -> MongoDB file storage on Project.generatedFiles
+  -> generated file validation and path/package safety checks
+```
+
+Generation services:
+
+```text
+server/services/generation/generationBatches.js
+server/services/generation/topologicalSort.js
+server/services/generation/codeGenerationService.js
+server/services/generation/generatedFileValidation.js
+server/services/generation/packageSafety.js
+server/services/generation/pathSafety.js
+server/services/ai/prompts/codeGenerationPrompt.js
+```
+
+### Generated Project Restrictions
+
+Generated projects must remain frontend-only.
+
+**Allowed:** React + Vite, JavaScript, Tailwind CSS, React Router, Redux Toolkit when useful, Lucide React, localStorage, mock data.
+
+**Disallowed:** Express backend, MongoDB/Mongoose/SQL, authentication/JWT/OAuth, Docker, Next.js, server secrets or server routes.
+
+Additional restrictions enforced at generation time:
+
+- `package.json` dependencies are allowlisted.
+- Lifecycle install scripts are rejected.
+- Unsafe paths such as `../`, `.env`, `node_modules`, and Docker files are rejected.
+- Generated file count and file size are limited.
+
+## Quality Review, Fix Loop, Dependency Graph, and Editing
+
+```text
+generated files
+  -> deterministic static validation
+  -> AST dependency graph
+  -> structured quality review findings
+  -> max-three-attempt fix loop
+  -> versioned file changes
+  -> natural-language targeted edits
+  -> restore previous snapshot
+```
+
+Services:
+
+```text
+server/services/review/dependencyGraph.js
+server/services/review/staticValidation.js
+server/services/review/reviewAgent.js
+server/services/review/fixAgent.js
+server/services/review/versioningService.js
+server/services/edit/intentRouter.js
+server/services/edit/editTargeting.js
+server/services/edit/editAgent.js
+```
+
+The AST graph stores relative imports, imported-by relationships, imported symbols, exports, JSX-rendered components, local functions, event handlers, Redux imports, and service imports. It is intentionally lightweight, not a full compiler.
+
+Natural-language edits route into build/edit/explain/unknown intent. File versioning snapshots the project before edit/fix operations; restore currently restores the latest snapshot.
+
+## Explain Mode, Memory, and Deployment
+
+```text
+server/models/VerifiedFix.js
+server/services/explain/explainAgent.js
+server/services/deploy/deploymentService.js
+server/services/memory/verifiedFixMemory.js
+```
+
+- **Explain Mode** is grounded in the generated files and the AST dependency graph — it reads real files before answering rather than guessing.
+- **VerifiedFix memory** is a flat model with keyword-based retrieval (not vector search).
+- **Deployment** defaults to a mock/demo provider (`DEPLOY_PROVIDER=mock`); demo URLs use the `demo://deployment/...` scheme and are clearly labeled as demo mode. A real Vercel provider adapter and `VERCEL_TOKEN` are required before enabling production deployment.
+
+## Known Limitations
+
+- UUID provides visitor continuity only, not authentication.
+- Deployment is mock/demo unless a real provider adapter is added.
+- Verified-fix retrieval is keyword-based, not vector-based.
+- Explain Mode is static-analysis grounded; it does not execute UI interactions.
+- Restore currently restores only the latest snapshot.
+- Generated-project editing handles common cases and targeted transformations, not arbitrary full semantic refactors.
+
+## Verification
+
+```bash
+cd server
+npm test
+npm audit --omit=dev
+node -e "import('./app.js').then(() => console.log('server import ok'))"
+```

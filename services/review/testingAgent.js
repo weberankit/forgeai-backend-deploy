@@ -47,6 +47,7 @@ function analyzeRenderableFile(file, fileMap) {
   const importedNames = new Set();
   const localNames = new Set();
   const renderedNames = new Set();
+  const scopedRenderedNames = new Set();
   let hasDefaultExport = false;
   let hasAnyExport = false;
   let hasJsx = false;
@@ -72,12 +73,15 @@ function analyzeRenderableFile(file, fileMap) {
       if (pathRef.node.id?.name) localNames.add(pathRef.node.id.name);
     },
     VariableDeclarator(pathRef) {
-      if (pathRef.node.id?.name) localNames.add(pathRef.node.id.name);
+      for (const name of bindingNames(pathRef.node.id)) localNames.add(name);
     },
     JSXOpeningElement(pathRef) {
       hasJsx = true;
       const name = rootJsxName(pathRef.node.name);
-      if (name && /^[A-Z]/.test(name)) renderedNames.add(name);
+      if (name && /^[A-Z]/.test(name)) {
+        renderedNames.add(name);
+        if (pathRef.scope.hasBinding(name)) scopedRenderedNames.add(name);
+      }
     },
     JSXFragment() {
       hasJsx = true;
@@ -95,12 +99,22 @@ function analyzeRenderableFile(file, fileMap) {
   }
   for (const renderedName of renderedNames) {
     if (builtinJsxNames.has(renderedName)) continue;
-    if (!importedNames.has(renderedName) && !localNames.has(renderedName)) {
+    if (!scopedRenderedNames.has(renderedName) && !importedNames.has(renderedName) && !localNames.has(renderedName)) {
       errors.push(issue('smoke_undefined_render_symbol', 'Rendered component is not imported or locally defined: ' + renderedName, file.path));
     }
   }
 
   return { errors, warnings };
+}
+
+function bindingNames(node) {
+  if (!node) return [];
+  if (node.type === 'Identifier') return [node.name];
+  if (node.type === 'ObjectPattern') return node.properties.flatMap((property) => bindingNames(property.value || property.argument));
+  if (node.type === 'ArrayPattern') return node.elements.flatMap(bindingNames);
+  if (node.type === 'AssignmentPattern') return bindingNames(node.left);
+  if (node.type === 'RestElement') return bindingNames(node.argument);
+  return [];
 }
 
 function resolveRelativeImport(fromPath, specifier, fileMap) {

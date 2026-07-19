@@ -11,6 +11,13 @@ Rules:
 - Include a concrete route for /. Every route component must have a matching src/pages/<Component>.jsx file.
 - List every browser npm package actually required by planned code in requiredDependencies. Do not list server packages.
 - Give every file one complete responsibility and explicit dependsOn paths. Never plan the same path twice.
+- Choose one immutable stackManifest. Use browser_router unless the specification explicitly requires data-router loaders/actions. Assign exactly one owner file for each app-wide provider/singleton.
+- Every file entry must declare its imports, exports, consumers, component props, and provider requirements. Imports and dependsOn must reference exact paths present in fileList.
+- Every imported symbol must appear in the referenced file's exports. Every provider requirement must name a provider declared in stackManifest.providers, whose ownerFile must exist in fileList.
+- A file that imports another planned file must include that path in dependsOn. Do not create circular dependencies.
+- Plan package.json dependencies completely now. Later generation agents cannot add packages.
+- Only plan shared data, shell, or card files when the requested application actually needs them. Do not add generic AppShell, DataCard, or mockData files by default.
+- src/App.jsx must depend on every route page plus every layout/router/provider/store module that it imports. src/main.jsx must depend on src/App.jsx and any global stylesheet/provider it imports.
 
 Specification:
 ${JSON.stringify(specification, null, 2)}
@@ -20,9 +27,16 @@ ${clarification || 'No clarification.'}
 
 Required JSON shape:
 {
+  "stackManifest": {
+    "router": {"mode": "browser_router|data_router|none", "ownerFile": "src/App.jsx"},
+    "state": {"mode": "react_local_state|redux_toolkit|context", "ownerFile": "string|null"},
+    "styling": {"mode": "tailwind", "ownerFile": "src/index.css"},
+    "dataFetching": {"mode": "local_mock_data|browser_fetch", "ownerFile": "string|null"},
+    "providers": [{"name": "string", "ownerFile": "string"}]
+  },
   "requiredDependencies": ["string"],
   "folderStructure": ["string"],
-  "fileList": [{"path": "string", "responsibility": "string", "dependsOn": ["string"]}],
+  "fileList": [{"path": "string", "responsibility": "string", "dependsOn": ["string"], "imports": [{"path": "string", "symbols": ["string"]}], "exports": ["string"], "consumers": ["string"], "props": ["string"], "providerRequirements": ["string"]}],
   "routes": [{"path": "string", "component": "string"}],
   "reduxSlices": [{"name": "string", "state": ["string"], "responsibility": "string"}],
   "sharedComponentContracts": [{"name": "string", "props": ["string"], "responsibility": "string"}],

@@ -85,16 +85,34 @@ function inferDomain(prompt) {
 
 function mockBlueprint(specification = {}) {
   const routes = normalizedRoutes(specification.routes);
-  const pageFiles = routes.map((route) => ({ path: 'src/pages/' + route.component + '.jsx', responsibility: route.component + ' route UI', dependsOn: ['src/components/AppShell.jsx', 'src/data/mockData.js'], exports: ['default'] }));
+  const pageFiles = routes.map((route) => fileContract({
+    path: 'src/pages/' + route.component + '.jsx',
+    responsibility: route.component + ' route UI',
+    dependsOn: ['src/components/DataCard.jsx', 'src/data/mockData.js'],
+    imports: [
+      { path: 'src/components/DataCard.jsx', symbols: ['default'] },
+      { path: 'src/data/mockData.js', symbols: ['metrics', 'activity'] }
+    ],
+    exports: ['default'],
+    consumers: ['src/App.jsx']
+  }));
   return normalizeBlueprint({
+    stackManifest: {
+      router: { mode: 'browser_router', ownerFile: 'src/App.jsx' },
+      state: { mode: 'react_local_state', ownerFile: null },
+      styling: { mode: 'tailwind', ownerFile: 'src/index.css' },
+      dataFetching: { mode: 'local_mock_data', ownerFile: 'src/data/mockData.js' },
+      providers: [{ name: 'BrowserRouter', ownerFile: 'src/App.jsx' }]
+    },
     requiredDependencies: ['@vitejs/plugin-react', 'vite', 'react', 'react-dom', 'react-router-dom', 'tailwindcss', 'postcss', 'autoprefixer', 'lucide-react'],
     folderStructure: ['src/components', 'src/pages', 'src/data'],
     fileList: [
-      { path: 'src/main.jsx', responsibility: 'Render the React root', dependsOn: ['src/App.jsx'] },
-      { path: 'src/App.jsx', responsibility: 'Integrate application routes and navigation', dependsOn: pageFiles.map((file) => file.path), exports: ['default'] },
-      { path: 'src/data/mockData.js', responsibility: 'Prompt-specific realistic mock data', dependsOn: [] },
-      { path: 'src/components/AppShell.jsx', responsibility: 'Shared responsive application layout', dependsOn: [], exports: ['default'] },
-      { path: 'src/components/DataCard.jsx', responsibility: 'Reusable data presentation', dependsOn: [], exports: ['default'] },
+      fileContract({ path: 'src/index.css', responsibility: 'Global Tailwind styles and design tokens', consumers: ['src/main.jsx'] }),
+      fileContract({ path: 'src/main.jsx', responsibility: 'Render the React root', dependsOn: ['src/App.jsx', 'src/index.css'], imports: [{ path: 'src/App.jsx', symbols: ['default'] }, { path: 'src/index.css', symbols: [] }] }),
+      fileContract({ path: 'src/App.jsx', responsibility: 'Integrate application routes and navigation', dependsOn: ['src/components/AppShell.jsx', ...pageFiles.map((file) => file.path)], imports: [{ path: 'src/components/AppShell.jsx', symbols: ['default'] }, ...pageFiles.map((file) => ({ path: file.path, symbols: ['default'] }))], exports: ['default'], consumers: ['src/main.jsx'], providerRequirements: [] }),
+      fileContract({ path: 'src/data/mockData.js', responsibility: 'Prompt-specific realistic mock data', exports: ['metrics', 'activity'], consumers: pageFiles.map((file) => file.path) }),
+      fileContract({ path: 'src/components/AppShell.jsx', responsibility: 'Shared responsive application layout', exports: ['default'], consumers: ['src/App.jsx'], props: ['projectName', 'summary', 'navItems', 'children'], providerRequirements: ['BrowserRouter'] }),
+      fileContract({ path: 'src/components/DataCard.jsx', responsibility: 'Reusable data presentation', exports: ['default'], consumers: pageFiles.map((file) => file.path), props: ['label', 'value', 'status'] }),
       ...pageFiles
     ],
     routes,
@@ -114,16 +132,31 @@ function normalizeBlueprint(input = {}, specification = {}) {
     let filePath = String(raw?.path || '').replace(/^\/+/, '');
     if (filePath === 'src/app/App.jsx') filePath = 'src/App.jsx';
     if (!/^src\/.+\.(js|jsx|css|json)$/.test(filePath) && !['package.json', 'index.html', 'vite.config.js', 'tailwind.config.js', 'postcss.config.js'].includes(filePath)) continue;
-    map.set(filePath, { ...raw, path: filePath, dependsOn: Array.isArray(raw.dependsOn) ? raw.dependsOn.map((item) => item === 'src/app/App.jsx' ? 'src/App.jsx' : item) : [] });
+    map.set(filePath, fileContract({
+      ...raw,
+      path: filePath,
+      dependsOn: normalizeContractPaths(raw.dependsOn),
+      imports: (raw.imports || []).map((entry) => ({ ...entry, path: normalizeContractPath(entry?.path), symbols: Array.isArray(entry?.symbols) ? entry.symbols : [] })),
+      consumers: normalizeContractPaths(raw.consumers)
+    }));
   }
   for (const route of routes) {
     const path = 'src/pages/' + route.component + '.jsx';
-    if (!map.has(path)) map.set(path, { path, responsibility: route.component + ' route UI', dependsOn: ['src/data/mockData.js'], exports: ['default'] });
+    if (!map.has(path)) map.set(path, fileContract({ path, responsibility: route.component + ' route UI', exports: ['default'], consumers: ['src/App.jsx'] }));
   }
-  map.set('src/main.jsx', { ...(map.get('src/main.jsx') || {}), path: 'src/main.jsx', responsibility: 'Render React root', dependsOn: ['src/App.jsx'] });
-  map.set('src/App.jsx', { ...(map.get('src/App.jsx') || {}), path: 'src/App.jsx', responsibility: 'Integrate actual pages, routes, and navigation', dependsOn: routes.map((route) => 'src/pages/' + route.component + '.jsx'), exports: ['default'] });
+  const main = fileContract({ ...(map.get('src/main.jsx') || {}), path: 'src/main.jsx', responsibility: 'Render React root' });
+  main.dependsOn = [...new Set([...main.dependsOn, 'src/App.jsx', ...(map.has('src/index.css') ? ['src/index.css'] : [])])];
+  map.set('src/main.jsx', main);
+  const app = fileContract({ ...(map.get('src/App.jsx') || {}), path: 'src/App.jsx', responsibility: 'Integrate actual pages, routes, navigation, and app-wide providers', exports: ['default'] });
+  app.dependsOn = [...new Set([...app.dependsOn, ...routes.map((route) => 'src/pages/' + route.component + '.jsx')])];
+  map.set('src/App.jsx', app);
+  const stackManifest = normalizeStackManifest(input.stackManifest);
+  const baseDependencies = ['@vitejs/plugin-react', 'vite', 'react', 'react-dom', 'tailwindcss', 'postcss', 'autoprefixer', 'lucide-react'];
+  if (stackManifest.router.mode !== 'none') baseDependencies.push('react-router-dom');
+  if (stackManifest.state.mode === 'redux_toolkit') baseDependencies.push('@reduxjs/toolkit', 'react-redux');
   return {
-    requiredDependencies: [...new Set(['@vitejs/plugin-react', 'vite', 'react', 'react-dom', 'react-router-dom', 'tailwindcss', 'postcss', 'autoprefixer', 'lucide-react', ...(input.requiredDependencies || [])])],
+    stackManifest,
+    requiredDependencies: [...new Set([...baseDependencies, ...(input.requiredDependencies || [])])],
     folderStructure: Array.isArray(input.folderStructure) ? input.folderStructure : ['src/components', 'src/pages', 'src/data'],
     fileList: [...map.values()],
     routes,
@@ -133,6 +166,32 @@ function normalizeBlueprint(input = {}, specification = {}) {
     localStorageBehavior: Array.isArray(input.localStorageBehavior) ? input.localStorageBehavior : [],
     implementationPhases: Array.isArray(input.implementationPhases) ? input.implementationPhases : [],
     acceptanceCriteria: Array.isArray(input.acceptanceCriteria) ? input.acceptanceCriteria : []
+  };
+}
+
+function fileContract(input = {}) {
+  return {
+    ...input,
+    responsibility: String(input.responsibility || 'Implement ' + String(input.path || 'frontend file')),
+    dependsOn: Array.isArray(input.dependsOn) ? input.dependsOn.filter(Boolean) : [],
+    imports: Array.isArray(input.imports) ? input.imports : [],
+    exports: Array.isArray(input.exports) ? input.exports : [],
+    consumers: Array.isArray(input.consumers) ? input.consumers : [],
+    props: Array.isArray(input.props) ? input.props : [],
+    providerRequirements: Array.isArray(input.providerRequirements) ? input.providerRequirements : []
+  };
+}
+
+function normalizeContractPath(value) { return String(value || '') === 'src/app/App.jsx' ? 'src/App.jsx' : String(value || '').replace(/^\/+/, ''); }
+function normalizeContractPaths(values) { return Array.isArray(values) ? values.map(normalizeContractPath).filter(Boolean) : []; }
+
+function normalizeStackManifest(input = {}) {
+  return {
+    router: { mode: input.router?.mode || 'browser_router', ownerFile: input.router?.ownerFile ?? 'src/App.jsx' },
+    state: { mode: input.state?.mode || 'react_local_state', ownerFile: input.state?.ownerFile ?? null },
+    styling: { mode: input.styling?.mode || 'tailwind', ownerFile: input.styling?.ownerFile ?? 'src/index.css' },
+    dataFetching: { mode: input.dataFetching?.mode || 'local_mock_data', ownerFile: input.dataFetching?.ownerFile ?? null },
+    providers: Array.isArray(input.providers) ? input.providers : []
   };
 }
 

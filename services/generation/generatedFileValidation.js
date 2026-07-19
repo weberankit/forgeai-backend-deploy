@@ -8,7 +8,7 @@ const requiredFiles = ['package.json', 'index.html', 'src/main.jsx', 'src/App.js
 const blockedPathPatterns = [/^server\//i, /^api\//i, /Dockerfile/i, /docker-compose/i, /auth/i, /jwt/i, /oauth/i, /mongoose/i, /mongodb/i, /express/i];
 const importRegex = /import\s+(?:[^'";]+?\s+from\s+)?['"]([^'"]+)['"]/g;
 
-export function validateGeneratedFiles(files, targetFiles = []) {
+export function validateGeneratedFiles(files, targetFiles = [], manifest = null) {
   const normalized = normalizeAndValidateFileBasics(files);
   const pathSet = new Set(normalized.map((file) => file.path));
   for (const requiredFile of requiredFiles) {
@@ -17,17 +17,35 @@ export function validateGeneratedFiles(files, targetFiles = []) {
   assertTargetsReturned(pathSet, targetFiles);
   validateRelativeImports(normalized, pathSet);
   assertSymbols(normalized);
+  assertManifestExports(normalized, manifest);
   return normalized;
 }
 
-export function validateGenerationBatch(files, targetFiles, existingFiles = []) {
+export function validateGenerationBatch(files, targetFiles, existingFiles = [], manifest = null) {
   const normalized = normalizeAndValidateFileBasics(files);
   const pathSet = new Set(normalized.map((file) => file.path));
   assertTargetsReturned(pathSet, targetFiles);
   const combined = normalizeAndValidateFileBasics(mergeFiles(existingFiles, files));
   validateRelativeImports(combined, new Set(combined.map((file) => file.path)), pathSet);
   assertSymbols(combined, pathSet);
+  assertManifestExports(combined, manifest, pathSet);
   return normalized;
+}
+
+function assertManifestExports(files, manifest, scopedPathSet = null) {
+  if (!manifest?.files) return;
+  const validation = validateProjectSymbols(files);
+  const errors = [];
+  for (const [filePath, contract] of Object.entries(manifest.files)) {
+    if (scopedPathSet && !scopedPathSet.has(filePath)) continue;
+    const table = validation.tables[filePath];
+    if (!table) continue;
+    for (const expected of contract.expectedExports || []) {
+      if (expected === 'default' && table.defaultExports === 0) errors.push(filePath + ' must provide its planned default export');
+      if (expected !== 'default' && !table.namedExports.has(expected)) errors.push(filePath + ' must provide planned export ' + expected);
+    }
+  }
+  if (errors.length) throw httpError(400, errors.join('; '));
 }
 
 export function mergeFiles(existingFiles, newFiles) {
@@ -73,13 +91,16 @@ function assertSymbols(files, scopedPathSet = null) {
 }
 
 function assertTargetsReturned(pathSet, targetFiles = []) {
+  const missing = [];
   for (const targetFile of targetFiles) {
     const normalizedTarget = normalizeProjectPath(targetFile);
-    if (!pathSet.has(normalizedTarget)) throw httpError(400, 'Generation batch did not return target file: ' + normalizedTarget);
+    if (!pathSet.has(normalizedTarget)) missing.push(normalizedTarget);
   }
+  if (missing.length) throw httpError(400, 'Generation batch did not return target files: ' + missing.join(', '));
 }
 
 function validateRelativeImports(files, pathSet, scopedPathSet = null) {
+  const unresolved = [];
   for (const file of files) {
     if (!/\.(jsx|js)$/.test(file.path)) continue;
     if (scopedPathSet && !scopedPathSet.has(file.path)) continue;
@@ -92,10 +113,11 @@ function validateRelativeImports(files, pathSet, scopedPathSet = null) {
       const base = normalizeProjectPath(path.posix.join(dir, specifier));
       const candidates = [base, base + '.js', base + '.jsx', base + '.css', path.posix.join(base, 'index.js'), path.posix.join(base, 'index.jsx')];
       if (!candidates.some((candidate) => pathSet.has(candidate))) {
-        throw httpError(400, 'Relative import does not resolve in ' + file.path + ': ' + specifier);
+        unresolved.push(file.path + ': ' + specifier);
       }
     }
   }
+  if (unresolved.length) throw httpError(400, 'Relative imports do not resolve: ' + unresolved.join('; '));
 }
 
 function isScopedFinding(item, scopedPathSet) {

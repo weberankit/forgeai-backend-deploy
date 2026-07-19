@@ -37,16 +37,20 @@ export function buildProjectManifest(blueprint = {}, batches = []) {
       files[path] = {
         owner,
         operation: 'create',
+        responsibility: String(blueprintFile.responsibility || ''),
         expectedExports: expectedExportsFor(path, blueprint),
         imports: Array.isArray(blueprintFile.imports) ? blueprintFile.imports : [],
         dependsOn: (blueprintFile.dependsOn || []).map(normalizeSafe).filter(Boolean),
-        consumers: []
+        consumers: (blueprintFile.consumers || []).map(normalizeSafe).filter(Boolean),
+        props: Array.isArray(blueprintFile.props) ? blueprintFile.props : [],
+        providerRequirements: Array.isArray(blueprintFile.providerRequirements) ? blueprintFile.providerRequirements : []
       };
     }
   }
   for (const [consumer, contract] of Object.entries(files)) {
     for (const dependency of contract.dependsOn) if (files[dependency]) files[dependency].consumers.push(consumer);
   }
+  for (const contract of Object.values(files)) contract.consumers = [...new Set(contract.consumers)];
   if (conflicts.length) throw new Error('Duplicate file ownership: ' + conflicts.map((item) => item.path + ' (' + item.owners.join(', ') + ')').join('; '));
   const version = crypto.createHash('sha256').update(JSON.stringify(files)).digest('hex').slice(0, 16);
   return { version, files };

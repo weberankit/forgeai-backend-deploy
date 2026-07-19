@@ -150,19 +150,13 @@ test('builds dependency-ordered frontend agent generation DAG', () => {
   });
   const stages = buildAgentExecutionStages(batches);
 
-  assert.deepEqual(stages.map((stage) => stage.phase), [
-    'project_setup',
-    'component_registry',
-    'layout_and_routing',
-    'page_and_styling',
-    'integration'
-  ]);
-  assert.equal(stages[3].parallel, true);
-  assert.deepEqual(stages[3].batches.map((batch) => batch.agentName).sort(), ['Page Agent', 'Styling Agent']);
-  assert.equal(stages[0].batches[0].agentName, 'Project Setup Agent');
-  assert.equal(stages[1].batches[0].agentName, 'Component Agent');
-  assert.equal(stages[2].batches[0].agentName, 'Layout Agent');
-  assert.equal(stages[4].batches[0].agentName, 'Frontend Manager Agent');
+  const stageOf = (file) => stages.findIndex((stage) => stage.batches.some((batch) => batch.files.includes(file)));
+  assert.equal(stageOf('package.json'), 0);
+  assert.ok(stageOf('src/components/Button.jsx') < stageOf('src/layouts/Shell.jsx'));
+  assert.ok(stageOf('src/layouts/Shell.jsx') < stageOf('src/pages/HomePage.jsx'));
+  assert.ok(stageOf('src/pages/HomePage.jsx') < stageOf('src/App.jsx'));
+  assert.ok(stageOf('src/App.jsx') < stageOf('src/main.jsx'));
+  assert.ok(stages.some((stage) => stage.parallel));
 });
 
 
@@ -181,17 +175,14 @@ test('ignores package-like blueprint file entries during generation planning', (
 });
 
 
-test('breaks circular blueprint dependencies during generation planning', () => {
-  const batches = buildGenerationBatches({
+test('rejects circular blueprint dependencies during generation planning', () => {
+  assert.throws(() => buildGenerationBatches({
     routes: [{ path: '/', component: 'HomePage' }],
     fileList: [
       { path: 'src/routes/AppRouter.jsx', dependsOn: ['src/pages/HomePage.jsx'] },
       { path: 'src/pages/HomePage.jsx', dependsOn: ['src/routes/AppRouter.jsx'] }
     ]
-  });
-  const allFiles = batches.flatMap((batch) => batch.files);
-  assert.equal(allFiles.includes('src/routes/AppRouter.jsx'), true);
-  assert.equal(allFiles.includes('src/pages/HomePage.jsx'), true);
+  }), /Circular blueprint dependency/);
 });
 
 

@@ -11,11 +11,39 @@ export function runDeterministicRepairs(previousFiles = [], proposedFiles = [], 
   combined = combined.map((file) => proposedPaths.has(file.path) ? repairDuplicateStatements(file, repairs) : file);
   combined = repairRelativePaths(combined, proposedPaths, manifest, repairs);
   combined = repairImportExportContracts(combined, proposedPaths, repairs);
+  combined = repairManifestExports(combined, proposedPaths, manifest, repairs);
   combined = repairUndefinedRenderedComponents(combined, proposedPaths, repairs);
   combined = repairRouteContracts(combined, proposedPaths, repairs);
   combined = combined.map((file) => proposedPaths.has(file.path) ? repairDuplicateStatements(file, repairs) : file);
   const repaired = combined.filter((file) => proposedPaths.has(file.path));
   return { files: repaired, repairs, validation: validateProjectSymbols(combined) };
+}
+
+function repairManifestExports(files, proposedPaths, manifest, repairs) {
+  if (!manifest?.files) return files;
+  return files.map((file) => {
+    const filePath = normalizeProjectPath(file.path);
+    if (!proposedPaths.has(filePath) || !/\.(js|jsx)$/.test(filePath)) return file;
+    const expected = manifest.files[filePath]?.expectedExports || [];
+    if (!expected.length) return file;
+    const table = analyzeExports(file);
+    const additions = [];
+    if (expected.includes('default') && table.defaultExports === 0) {
+      const componentName = path.posix.basename(filePath).replace(/\.(js|jsx)$/, '');
+      const candidate = table.declarations.has(componentName) ? componentName : table.namedExports.has(componentName) ? componentName : [...table.namedExports][0] || [...table.declarations][0];
+      if (candidate) {
+        additions.push('export default ' + candidate + ';');
+        repairs.push({ code: 'MISSING_PLANNED_DEFAULT_EXPORT', file: filePath, line: null, action: 'Added the manifest-required default export for ' + candidate + '.' });
+      }
+    }
+    for (const name of expected.filter((item) => item !== 'default')) {
+      if (!table.namedExports.has(name) && table.declarations.has(name)) {
+        additions.push('export { ' + name + ' };');
+        repairs.push({ code: 'MISSING_PLANNED_NAMED_EXPORT', file: filePath, line: null, action: 'Added the manifest-required named export ' + name + '.' });
+      }
+    }
+    return additions.length ? { ...file, content: String(file.content || '').replace(/\s*$/, '\n\n') + additions.join('\n') + '\n' } : file;
+  });
 }
 
 function repairDuplicateStatements(file, repairs) {

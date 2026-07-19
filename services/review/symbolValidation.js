@@ -68,7 +68,11 @@ function analyze(file, findings) {
     },
     JSXOpeningElement(ref) {
       const name = jsxName(ref.node.name);
-      if (name && /^[A-Z]/.test(name)) table.rendered.add(name.split('.')[0]);
+      if (name && /^[A-Z]/.test(name)) {
+        const rootName = name.split('.')[0];
+        table.rendered.add(rootName);
+        if (ref.scope.hasBinding(rootName)) table.scopedRenderedBindings.add(rootName);
+      }
     }
   });
   for (const [name] of declarations) {
@@ -76,7 +80,7 @@ function analyze(file, findings) {
     table.declarations.add(name);
   }
   for (const component of table.rendered) {
-    if (!table.declarations.has(component) && !table.importedLocals.has(component) && !['React', 'Fragment'].includes(component)) findings.push(issue('UNDEFINED_RENDERED_COMPONENT', file.path, null, component, 'Rendered component is not imported or declared: ' + component, 'Import the component or define it locally.'));
+    if (!table.scopedRenderedBindings.has(component) && !table.declarations.has(component) && !table.importedLocals.has(component) && !['React', 'Fragment'].includes(component)) findings.push(issue('UNDEFINED_RENDERED_COMPONENT', file.path, null, component, 'Rendered component is not imported or declared: ' + component, 'Import the component or define it locally.'));
   }
   return table;
 }
@@ -139,7 +143,7 @@ function jsxName(node) {
 }
 
 function emptyTable() {
-  return { imports: [], namedExports: new Set(), defaultExports: 0, declarations: new Set(), importedLocals: new Set(), rendered: new Set() };
+  return { imports: [], namedExports: new Set(), defaultExports: 0, declarations: new Set(), importedLocals: new Set(), rendered: new Set(), scopedRenderedBindings: new Set() };
 }
 
 function classifyParserError(message) {

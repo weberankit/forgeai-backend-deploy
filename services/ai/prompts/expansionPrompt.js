@@ -8,6 +8,9 @@ Rules:
 - Redux Toolkit is included only when useful.
 - Do not propose generated Express backends, databases, authentication, or server architecture.
 - Infer requirements where possible and list only genuine blocking questions.
+- Treat routes as the authoritative page list. Every pages entry must have exactly one matching routes entry, and every routes entry must have exactly one matching pages entry.
+- Use the same component name in routes that planning should use for src/pages/<Component>.jsx.
+- Do not ask the user to choose router, state, styling, data-fetching, provider, or folder architecture; record product assumptions here and let the planner lock implementation architecture.
 
 User prompt:
 ${prompt}

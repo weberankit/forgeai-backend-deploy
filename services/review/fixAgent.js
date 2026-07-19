@@ -8,7 +8,7 @@ import { repairMissingRelativeImports } from '../generation/importRepair.js';
 import { languageForPath, normalizeProjectPath } from '../generation/pathSafety.js';
 import path from 'path';
 
-export async function runFixLoop(project, { runtimeOutput = '', runtimeEvidence = {}, maxAttempts = 3 } = {}) {
+export async function runFixLoop(project, { runtimeOutput = '', runtimeEvidence = {}, maxAttempts = 2 } = {}) {
   const runs = [];
   let pendingVerifiedFix = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -54,6 +54,16 @@ export async function runFixLoop(project, { runtimeOutput = '', runtimeEvidence 
     pendingVerifiedFix = { review, changes: fixResult.changes, attempt };
     runtimeOutput = '';
     await project.save();
+  }
+  const finalReview = await runQualityReview({ project, runtimeOutput: '', runtimeEvidence, attempt: maxAttempts + 1 });
+  runs.push(finalReview);
+  project.reviewHistory.push(finalReview);
+  if (finalReview.status === 'passed') {
+    project.operationStatus = 'review_passed';
+    project.dependencyGraph = finalReview.staticValidation.graph;
+    if (pendingVerifiedFix) await storeVerifiedFixCandidate({ project, review: pendingVerifiedFix.review, fixChanges: pendingVerifiedFix.changes, validationPassed: true, previewEvidence: ['final review passed after fix attempt ' + pendingVerifiedFix.attempt] }).catch(() => null);
+    await project.save();
+    return { status: 'passed', review: finalReview, attempts: runs };
   }
   project.operationStatus = 'human_escalation';
   await project.save();

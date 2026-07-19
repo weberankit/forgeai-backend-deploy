@@ -6,8 +6,10 @@ import { assertDisjointWriteSets, buildProjectManifest } from '../services/gener
 import { buildAgentExecutionStages, buildGenerationBatches } from '../services/generation/generationBatches.js';
 import { validateGenerationBatch } from '../services/generation/generatedFileValidation.js';
 import { validateRouteIntegration } from '../services/review/routeValidation.js';
+import { runSmokeRenderTests } from '../services/review/testingAgent.js';
 import { expandSpecification, planFrontendProject } from '../services/ai/aiClient.js';
 import { buildCodeGenerationPrompt } from '../services/ai/prompts/codeGenerationPrompt.js';
+import { validateBlueprint, validateExpansionSpec } from '../services/ai/parseStructuredResponse.js';
 
 test('code generation prompt preserves the standard implementation workflow', () => {
   const prompt = buildCodeGenerationPrompt({
@@ -20,6 +22,8 @@ test('code generation prompt preserves the standard implementation workflow', ()
   assert.match(prompt, /4\. COMPLETENESS CHECK/);
   assert.match(prompt, /ScrollRestoration/);
   assert.match(prompt, /only the final JSON output should be returned/);
+  assert.match(prompt, /dependency list is locked/);
+  assert.doesNotMatch(prompt, /You may add a browser-compatible npm dependency/);
 });
 
 test('deterministically removes duplicate declarations and redundant named exports', () => {
@@ -38,6 +42,15 @@ test('symbol validation detects named/default mismatch and undefined JSX compone
   ]);
   assert.ok(result.errors.some((error) => error.code === 'MISSING_NAMED_EXPORT' && error.symbol === 'categories'));
   assert.ok(result.errors.some((error) => error.code === 'UNDEFINED_RENDERED_COMPONENT' && error.symbol === 'MissingCard'));
+});
+
+test('symbol and smoke validation accept JSX components bound through aliased props or local scope', () => {
+  const files = [
+    { path: 'src/components/DataCard.jsx', content: "export default function DataCard({ icon: Icon }) { return <Icon aria-hidden='true' />; }" },
+    { path: 'src/components/IconList.jsx', content: "export default function IconList({ items }) { return items.map((item) => { const Icon = item.icon; return <Icon key={item.id} />; }); }" }
+  ];
+  assert.equal(validateProjectSymbols(files).passed, true);
+  assert.equal(runSmokeRenderTests(files).passed, true);
 });
 
 test('deterministic path repair uses only one unambiguous generated target', () => {
@@ -96,17 +109,40 @@ test('batch validation scopes errors to generated targets and allows staged sibl
   ], ['src/pages/HomePage.jsx'], existing));
   assert.throws(() => validateGenerationBatch([
     { path: 'src/pages/HomePage.jsx', language: 'jsx', content: "import Missing from '../components/Missing.jsx'; export default function HomePage(){ return <Missing /> }" }
-  ], ['src/pages/HomePage.jsx'], existing), /Relative import does not resolve|Missing relative import/);
+  ], ['src/pages/HomePage.jsx'], existing), /Relative imports? do(?:es)? not resolve|Missing relative import/);
 });
 
 test('component batches are split into parallelizable chunks for faster multi-agent generation', () => {
   const fileList = Array.from({ length: 13 }, (_, index) => ({ path: 'src/components/Widget' + index + '.jsx', dependsOn: [] }));
   const batches = buildGenerationBatches({ routes: [{ path: '/', component: 'HomePage' }], fileList });
   const stages = buildAgentExecutionStages(batches);
-  const componentStage = stages.find((stage) => stage.phase === 'component_registry');
+  const componentStage = stages.find((stage) => stage.batches.filter((batch) => batch.agentName === 'Component Agent').length >= 3);
   assert.equal(componentStage.parallel, true);
-  assert.ok(componentStage.batches.length >= 3);
-  assert.ok(componentStage.batches.every((batch) => batch.files.length <= 6));
+  const componentBatches = componentStage.batches.filter((batch) => batch.agentName === 'Component Agent');
+  assert.ok(componentBatches.length >= 3);
+  assert.ok(componentBatches.every((batch) => batch.files.length <= 6));
+});
+
+test('blueprint contract rejects missing files and dependency cycles before generation', () => {
+  const base = {
+    stackManifest: {
+      router: { mode: 'browser_router', ownerFile: 'src/App.jsx' },
+      state: { mode: 'react_local_state', ownerFile: null },
+      styling: { mode: 'tailwind', ownerFile: 'src/index.css' },
+      dataFetching: { mode: 'local_mock_data', ownerFile: null },
+      providers: []
+    },
+    requiredDependencies: [], folderStructure: [], routes: [{ path: '/', component: 'HomePage' }], reduxSlices: [], sharedComponentContracts: [], mockDataRequirements: [], localStorageBehavior: [], implementationPhases: [], acceptanceCriteria: []
+  };
+  const contract = (path, dependsOn = []) => ({ path, responsibility: path, dependsOn, imports: [], exports: ['default'], consumers: [], props: [], providerRequirements: [] });
+  assert.equal(validateBlueprint({ ...base, fileList: [contract('src/pages/HomePage.jsx', ['src/components/Missing.jsx'])] }).valid, false);
+  assert.match(validateBlueprint({ ...base, fileList: [contract('src/pages/HomePage.jsx', ['src/App.jsx']), contract('src/App.jsx', ['src/pages/HomePage.jsx'])] }).message, /circular blueprint dependency/);
+});
+
+test('expansion contract requires pages and routes to remain synchronized', () => {
+  const result = validateExpansionSpec({ projectName: 'Test', projectSummary: 'Test', targetUsers: [], pages: [{ name: 'Home', route: '/' }], routes: [{ path: '/different', component: 'HomePage' }], sharedComponents: [], coreFeatures: [], dataRequirements: [], reduxRequirements: [], localStorageRequirements: [], responsiveRequirements: [], accessibilityRequirements: [], designDirection: [], assumptions: [], blockingQuestions: [] });
+  assert.equal(result.valid, false);
+  assert.match(result.message, /same route paths/);
 });
 
 test('deterministic repair rewrites default data import when previous module only has a named export', () => {
@@ -139,6 +175,15 @@ test('deterministic repair aligns named component import to default export', () 
   const page = result.files.find((file) => file.path === 'src/pages/LandingPage.jsx');
   assert.match(page.content, /import BookCard from '\.\.\/components\/BookCard\.jsx';/);
   assert.equal(result.validation.passed, true);
+});
+
+test('manifest contract repairs and enforces a page default export before integration', () => {
+  const manifest = { files: { 'src/pages/LandingPage.jsx': { expectedExports: ['default'] } } };
+  const namedOnly = [{ path: 'src/pages/LandingPage.jsx', language: 'jsx', content: 'export function LandingPage(){ return <main />; }' }];
+  assert.throws(() => validateGenerationBatch(namedOnly, ['src/pages/LandingPage.jsx'], [], manifest), /planned default export/);
+  const repaired = runDeterministicRepairs([], namedOnly, manifest);
+  assert.match(repaired.files[0].content, /export default LandingPage;/);
+  assert.doesNotThrow(() => validateGenerationBatch(repaired.files, ['src/pages/LandingPage.jsx'], [], manifest));
 });
 
 test('prompt-aware fallback treats selling books as a bookstore landing page', async () => {

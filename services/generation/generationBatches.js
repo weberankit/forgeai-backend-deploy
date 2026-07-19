@@ -12,12 +12,12 @@ const stylingFiles = ['src/index.css'];
 const requiredIntegrationFiles = ['src/App.jsx', 'src/main.jsx'];
 
 const phaseMeta = {
-  1: { phase: 'project_setup', agentName: 'Project Setup Agent', dependsOn: [] },
-  2: { phase: 'component_registry', agentName: 'Component Agent', dependsOn: ['Project Setup Agent'], concurrentGroup: 'component_registry' },
-  3: { phase: 'layout_and_routing', agentName: 'Layout Agent', dependsOn: ['Component Agent'] },
-  4: { phase: 'pages_and_features', agentName: 'Page Agent', dependsOn: ['Layout Agent'], concurrentGroup: 'page_and_styling' },
-  5: { phase: 'styling_system', agentName: 'Styling Agent', dependsOn: ['Layout Agent'], concurrentGroup: 'page_and_styling' },
-  6: { phase: 'integration', agentName: 'Frontend Manager Agent', dependsOn: ['Page Agent', 'Styling Agent'] }
+  1: { phase: 'project_setup', agentName: 'Project Setup Agent' },
+  2: { phase: 'component_registry', agentName: 'Component Agent' },
+  3: { phase: 'layout_and_routing', agentName: 'Layout Agent' },
+  4: { phase: 'pages_and_features', agentName: 'Page Agent' },
+  5: { phase: 'styling_system', agentName: 'Styling Agent' },
+  6: { phase: 'integration', agentName: 'Frontend Manager Agent' }
 };
 
 function safeNormalizeProjectPath(filePath) {
@@ -30,33 +30,17 @@ function safeNormalizeProjectPath(filePath) {
 
 function safeBlueprintFiles(fileList = []) {
   const normalized = [];
-  const validPaths = new Set();
   for (const file of fileList) {
     const path = safeNormalizeProjectPath(file?.path);
     if (!path) continue;
-    validPaths.add(path);
     normalized.push({ ...file, path });
   }
   return normalized.map((file) => ({
     ...file,
     dependsOn: Array.isArray(file.dependsOn)
-      ? file.dependsOn.map(safeNormalizeProjectPath).filter((dependency) => dependency && validPaths.has(dependency))
+      ? file.dependsOn.map(safeNormalizeProjectPath).filter(Boolean)
       : []
   }));
-}
-
-function sortBlueprintFilesSafely(fileList = []) {
-  const safeFiles = safeBlueprintFiles(fileList);
-  try {
-    return topologicalSortFiles(safeFiles);
-  } catch {
-    return safeFiles.map((file) => ({ ...file, dependsOn: [] }));
-  }
-}
-
-function uniquePush(paths, filePath) {
-  const normalized = normalizeProjectPath(filePath);
-  if (!paths.includes(normalized)) paths.push(normalized);
 }
 
 function classify(filePath) {
@@ -78,62 +62,71 @@ function chunk(items, size = 8) {
 }
 
 export function buildGenerationBatches(blueprint = {}) {
-  const paths = [];
-  setupFiles.forEach((filePath) => uniquePush(paths, filePath));
-
-  const blueprintFiles = Array.isArray(blueprint.fileList) ? sortBlueprintFilesSafely(blueprint.fileList) : [];
-  for (const file of blueprintFiles) uniquePush(paths, file.path);
-
-  uniquePush(paths, 'src/data/mockData.js');
-  uniquePush(paths, 'src/components/AppShell.jsx');
-  uniquePush(paths, 'src/components/DataCard.jsx');
-
+  const specs = new Map();
+  const add = (file) => {
+    const path = normalizeProjectPath(file.path);
+    const previous = specs.get(path);
+    specs.set(path, { ...(previous || {}), ...file, path, dependsOn: [...new Set([...(previous?.dependsOn || []), ...(file.dependsOn || [])])] });
+  };
+  setupFiles.forEach((path) => add({ path, dependsOn: [] }));
+  const blueprintFiles = Array.isArray(blueprint.fileList) ? safeBlueprintFiles(blueprint.fileList) : [];
+  for (const file of blueprintFiles) add(file);
   const routes = Array.isArray(blueprint.routes) ? blueprint.routes : [];
   for (const route of routes) {
     const component = String(route.component || '').replace(/[^A-Za-z0-9]/g, '') || 'GeneratedPage';
-    uniquePush(paths, 'src/pages/' + component + '.jsx');
+    add({ path: 'src/pages/' + component + '.jsx', dependsOn: [] });
   }
+  stylingFiles.forEach((path) => add({ path, dependsOn: [] }));
+  add({ path: 'src/App.jsx', dependsOn: routes.map((route) => 'src/pages/' + String(route.component || '').replace(/[^A-Za-z0-9]/g, '') + '.jsx') });
+  add({ path: 'src/main.jsx', dependsOn: ['src/App.jsx', 'src/index.css'] });
 
-  stylingFiles.forEach((filePath) => uniquePush(paths, filePath));
-  requiredIntegrationFiles.forEach((filePath) => uniquePush(paths, filePath));
+  for (const file of specs.values()) {
+    if (!setupFiles.includes(file.path) && !file.dependsOn.includes('package.json')) file.dependsOn.push('package.json');
+  }
+  const sorted = topologicalSortFiles([...specs.values()]);
+  const levelByPath = new Map();
+  for (const file of sorted) levelByPath.set(file.path, file.dependsOn.length ? Math.max(...file.dependsOn.map((path) => levelByPath.get(path) || 0)) + 1 : 0);
 
   const grouped = new Map();
-  for (const filePath of paths) {
-    const group = classify(filePath);
-    if (!grouped.has(group)) grouped.set(group, []);
-    grouped.get(group).push(filePath);
+  for (const file of sorted) {
+    const group = classify(file.path);
+    const key = levelByPath.get(file.path) + ':' + group;
+    if (!grouped.has(key)) grouped.set(key, { level: levelByPath.get(file.path), group, files: [] });
+    grouped.get(key).files.push(file.path);
   }
-
   const batches = [];
-  for (const group of [1, 2, 3, 4, 5, 6]) {
-    const groupFiles = grouped.get(group) || [];
-    const meta = phaseMeta[group];
-    for (const files of chunk(groupFiles, phaseChunkSizes[group] || 8)) {
+  for (const entry of [...grouped.values()].sort((a, b) => a.level - b.level || a.group - b.group)) {
+    const meta = phaseMeta[entry.group];
+    for (const files of chunk(entry.files, phaseChunkSizes[entry.group] || 8)) {
       batches.push({
         batchNumber: batches.length + 1,
         phase: meta.phase,
         agentName: meta.agentName,
-        dependsOn: meta.dependsOn,
-        concurrentGroup: meta.concurrentGroup || null,
+        dependencyLevel: entry.level,
+        fileDependencies: [...new Set(files.flatMap((path) => specs.get(path)?.dependsOn || []))],
+        dependsOn: [...new Set(files.flatMap((path) => specs.get(path)?.dependsOn || []))],
+        concurrentGroup: null,
         files
       });
     }
   }
+  const ownerBatch = new Map();
+  for (const batch of batches) for (const path of batch.files) ownerBatch.set(path, batch.batchNumber);
+  for (const batch of batches) batch.dependsOnBatches = [...new Set(batch.fileDependencies.map((path) => ownerBatch.get(path)).filter((number) => number && number !== batch.batchNumber))];
   return batches;
 }
 
 export function buildAgentExecutionStages(batches = []) {
-  const byPhase = new Map();
-  for (const batch of batches) {
-    if (!byPhase.has(batch.phase)) byPhase.set(batch.phase, []);
-    byPhase.get(batch.phase).push(batch);
+  const pending = new Map(batches.map((batch) => [batch.batchNumber, batch]));
+  const completed = new Set();
+  const stages = [];
+  while (pending.size) {
+    const ready = [...pending.values()].filter((batch) => (batch.dependsOnBatches || []).every((number) => completed.has(number) || !pending.has(number)));
+    if (!ready.length) throw new Error('Generation batch dependency cycle detected.');
+    const phases = [...new Set(ready.map((batch) => batch.phase))];
+    const phase = phases.length === 1 ? phases[0] : phases.every((item) => ['pages_and_features', 'styling_system'].includes(item)) ? 'page_and_styling' : 'generation_wave_' + (stages.length + 1);
+    stages.push({ phase, parallel: ready.length > 1, batches: ready });
+    for (const batch of ready) { pending.delete(batch.batchNumber); completed.add(batch.batchNumber); }
   }
-  const stage = (phase, parallel = false) => ({ phase, parallel, batches: byPhase.get(phase) || [] });
-  return [
-    stage('project_setup'),
-    stage('component_registry', true),
-    stage('layout_and_routing'),
-    { phase: 'page_and_styling', parallel: true, batches: [...(byPhase.get('pages_and_features') || []), ...(byPhase.get('styling_system') || [])] },
-    stage('integration')
-  ].filter((item) => item.batches.length);
+  return stages;
 }

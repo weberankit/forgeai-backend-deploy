@@ -130,20 +130,20 @@ export async function generateProjectFiles(project, options = {}) {
     project.generationProgress = 90;
     await project.save();
     project.generatedFiles = repairProjectFiles(project.generatedFiles || [], manifest, warnings);
-    validateGeneratedFiles(project.generatedFiles || []);
+    validateGeneratedFiles(project.generatedFiles || [], [], manifest);
     project.dependencyGraph = runStaticValidation(project.generatedFiles || []).graph;
     let smokeRenderTest = runSmokeRenderTests(project.generatedFiles || []);
     if (!smokeRenderTest.passed) {
       const fixResult = await runFixLoop(project, {
         runtimeOutput: 'Smoke/render test failed: ' + smokeRenderTest.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '),
-        maxAttempts: 3
+        maxAttempts: 2
       });
       if (fixResult.status !== 'passed') {
         smokeRenderTest = runSmokeRenderTests(project.generatedFiles || []);
         throw new Error('Smoke/render test failed after fix attempts: ' + smokeRenderTest.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
       }
       project.generatedFiles = repairProjectFiles(project.generatedFiles || [], manifest, warnings);
-      validateGeneratedFiles(project.generatedFiles || []);
+      validateGeneratedFiles(project.generatedFiles || [], [], manifest);
       project.dependencyGraph = runStaticValidation(project.generatedFiles || []).graph;
     }
 
@@ -187,7 +187,7 @@ export async function repairGenerationBatch({ project, batch, generated, previou
     const repairWarnings = [...deterministic.repairs, ...postImportDeterministic.repairs];
     if (repairWarnings.length) candidate.warnings = [...(candidate.warnings || []), ...repairWarnings.map((item) => 'Deterministic repair: ' + item.file + ' - ' + item.action)];
     try {
-      validateGenerationBatch(candidate.files, batch.files, previousFiles);
+      validateGenerationBatch(candidate.files, batch.files, previousFiles, manifest);
       validateBatchGraph(candidate.files, previousFiles);
       if (attempt > 1) {
         candidate.warnings = [
@@ -449,7 +449,7 @@ function contentForPath(filePath, spec, blueprint) {
   if (filePath === 'src/components/AppShell.jsx') return appShell();
   if (filePath === 'src/components/DataCard.jsx') return dataCard();
   if (filePath === 'src/app/App.jsx') return "export { default } from '../App.jsx';\n";
-  if (filePath.startsWith('src/pages/')) return pageComponent(filePath, spec);
+  if (filePath.startsWith('src/pages/')) return pageComponent(filePath, spec, blueprint);
   if (filePath.startsWith('src/components/')) return genericComponent(filePath);
   if (filePath.startsWith('src/layouts/')) return genericLayout(filePath);
   if (filePath.startsWith('src/store/')) return storeFile(filePath);
@@ -497,9 +497,17 @@ function mainJsx() {
 
 function appJsx(spec, blueprint) {
   const routeList = routesFromBlueprint(blueprint);
-  const imports = ["import { BrowserRouter, Link, Route, Routes } from 'react-router-dom';", "import AppShell from './components/AppShell.jsx';"];
+  const planned = new Set((blueprint.fileList || []).map((file) => String(file.path || '')));
+  const hasShell = planned.has('src/components/AppShell.jsx');
+  const routerMode = blueprint.stackManifest?.router?.mode || 'browser_router';
+  const imports = routerMode === 'none' ? [] : ["import { BrowserRouter, Link, Route, Routes } from 'react-router-dom';"];
+  if (hasShell) imports.push("import AppShell from './components/AppShell.jsx';");
   const pageImports = routeList.map((route) => "import " + route.component + " from './pages/" + route.component + ".jsx';");
-  return imports.concat(pageImports).join('\n') + "\n\nconst navItems = " + JSON.stringify(routeList.map((route) => ({ label: route.label, path: route.path })), null, 2) + ";\n\nexport default function App() {\n  return (\n    <BrowserRouter>\n      <AppShell projectName=\"" + escapeJsxAttr(spec.projectName || 'Generated App') + "\" summary=\"" + escapeJsxAttr(spec.projectSummary || 'Generated frontend application') + "\" navItems={navItems}>\n        <Routes>\n" + routeList.map((route) => "          <Route path=\"" + route.path + "\" element={<" + route.component + " />} />").join('\n') + "\n          <Route path=\"*\" element={<div className=\"rounded-lg border border-slate-200 bg-white p-6\"><h2 className=\"text-xl font-semibold\">Page not found</h2><Link className=\"mt-3 inline-block text-blue-600\" to=\"/\">Return home</Link></div>} />\n        </Routes>\n      </AppShell>\n    </BrowserRouter>\n  );\n}\n";
+  if (routerMode === 'none') return pageImports.join('\n') + "\n\nexport default function App() {\n  return <" + routeList[0].component + " />;\n}\n";
+  const content = "        <Routes>\n" + routeList.map((route) => "          <Route path=\"" + route.path + "\" element={<" + route.component + " />} />").join('\n') + "\n          <Route path=\"*\" element={<div className=\"rounded-lg border border-slate-200 bg-white p-6\"><h2 className=\"text-xl font-semibold\">Page not found</h2><Link className=\"mt-3 inline-block text-blue-600\" to=\"/\">Return home</Link></div>} />\n        </Routes>";
+  const body = hasShell ? "      <AppShell projectName=\"" + escapeJsxAttr(spec.projectName || 'Generated App') + "\" summary=\"" + escapeJsxAttr(spec.projectSummary || 'Generated frontend application') + "\" navItems={navItems}>\n" + content + "\n      </AppShell>" : content;
+  const nav = hasShell ? "\n\nconst navItems = " + JSON.stringify(routeList.map((route) => ({ label: route.label, path: route.path })), null, 2) + ";" : '';
+  return imports.concat(pageImports).join('\n') + nav + "\n\nexport default function App() {\n  return (\n    <BrowserRouter>\n" + body + "\n    </BrowserRouter>\n  );\n}\n";
 }
 
 function mockData(spec) {
@@ -524,9 +532,13 @@ function dataCard() {
   return "export default function DataCard({ label, value, status }) {\n  return (\n    <article className=\"rounded-xl border border-slate-200 bg-white p-5 shadow-sm\">\n      <p className=\"text-sm font-medium text-slate-500\">{label}</p>\n      <div className=\"mt-3 flex items-end justify-between gap-3\">\n        <p className=\"text-3xl font-semibold text-slate-950\">{value}</p>\n        <span className=\"rounded-full bg-blue-50 px-2.5 py-1 text-xs font-semibold text-blue-700\">{status}</span>\n      </div>\n    </article>\n  );\n}\n";
 }
 
-function pageComponent(filePath, spec) {
+function pageComponent(filePath, spec, blueprint = {}) {
   const name = componentNameFromPath(filePath);
   const pageTitle = name.replace(/Page$/, '').replace(/([A-Z])/g, ' $1').trim() || 'Overview';
+  const planned = new Set((blueprint.fileList || []).map((file) => String(file.path || '')));
+  if (!planned.has('src/components/DataCard.jsx') || !planned.has('src/data/mockData.js')) {
+    return "export default function " + name + "() {\n  return (\n    <main className=\"min-h-screen bg-slate-950 px-6 py-16 text-white\">\n      <div className=\"mx-auto max-w-4xl\">\n        <p className=\"text-sm font-medium text-blue-300\">Generated frontend</p>\n        <h1 className=\"mt-3 text-4xl font-semibold\">" + escapeText(pageTitle) + "</h1>\n        <p className=\"mt-4 max-w-2xl text-slate-300\">" + escapeText(spec.projectSummary || 'A responsive React interface generated from the approved blueprint.') + "</p>\n      </div>\n    </main>\n  );\n}\n";
+  }
   return "import DataCard from '../components/DataCard.jsx';\nimport { activity, metrics } from '../data/mockData.js';\n\nexport default function " + name + "() {\n  return (\n    <div className=\"space-y-6\">\n      <section className=\"rounded-2xl bg-slate-950 p-6 text-white\">\n        <p className=\"text-sm font-medium text-blue-200\">Generated frontend</p>\n        <h2 className=\"mt-2 text-3xl font-semibold\">" + escapeText(pageTitle) + "</h2>\n        <p className=\"mt-3 max-w-3xl text-sm leading-6 text-slate-300\">" + escapeText(spec.projectSummary || 'A responsive React interface generated from the approved blueprint.') + "</p>\n      </section>\n      <section className=\"grid gap-4 md:grid-cols-2 lg:grid-cols-4\">\n        {metrics.map((metric) => <DataCard key={metric.label} {...metric} />)}\n      </section>\n      <section className=\"rounded-xl border border-slate-200 bg-white p-5\">\n        <h3 className=\"text-lg font-semibold\">Workflow</h3>\n        <div className=\"mt-4 grid gap-3\">\n          {activity.map((item) => (\n            <article key={item.id} className=\"rounded-lg border border-slate-200 p-4\">\n              <div className=\"flex flex-col justify-between gap-2 sm:flex-row\">\n                <div>\n                  <h4 className=\"font-semibold\">{item.title}</h4>\n                  <p className=\"mt-1 text-sm text-slate-500\">{item.description}</p>\n                </div>\n                <span className=\"text-sm font-medium text-slate-500\">{item.owner}</span>\n              </div>\n            </article>\n          ))}\n        </div>\n      </section>\n    </div>\n  );\n}\n";
 }
 

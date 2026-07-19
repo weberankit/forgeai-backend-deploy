@@ -31,7 +31,7 @@ export async function applyNaturalLanguageEdit(project, message) {
   project.operationStatus = 'validating';
   const validation = runStaticValidation(project.generatedFiles || []);
   project.dependencyGraph = validation.graph;
-  if (!validation.passed) await runFixLoop(project, { maxAttempts: 3 });
+  if (!validation.passed) await runFixLoop(project, { maxAttempts: 2 });
   else project.operationStatus = 'preview_ready';
   await project.save();
   return { status: project.operationStatus, changes, targets: targeting.targets, warnings: editResult.warnings, validation };

@@ -23,11 +23,11 @@ export function buildCodeGenerationPrompt({ specification, blueprint, previousFi
     '- Lucide React',
     '- localStorage',
     '- Mock data',
-    '- Safe browser-compatible npm packages when they materially implement the requested UI behavior',
+    '- Browser-compatible npm packages already declared by the blueprint and package.json',
     '- Frontend-only mock flows for payments, auth, uploads, email, maps, analytics, or third-party integrations unless the package is already in the allowed stack',
     '',
     'Disallowed: Express, MongoDB, Mongoose, SQL, authentication, JWT, OAuth, Docker, Next.js, server routes, server-only secrets.',
-    'You may add a browser-compatible npm dependency when it is needed for the requested UI. Add it to package.json and import it normally. Never add server frameworks, databases, server auth packages, lifecycle scripts, Git/URL dependencies, or packages that require secrets.',
+    'The dependency list is locked by the approved blueprint. Only the Project Setup Agent may write package.json, and only when package.json is one of its target files. Every other agent must use declared dependencies and must never add or assume a package.',
     '',
     'Return this exact JSON shape:',
     '{ "files": [{ "path": "src/components/Header.jsx", "language": "jsx", "content": "complete file content" }], "contracts": [], "warnings": [] }',
@@ -36,6 +36,7 @@ export function buildCodeGenerationPrompt({ specification, blueprint, previousFi
     'Return exactly one complete version of each target file. Never duplicate imports, declarations, exports, routes, or file paths.',
     'Implement the specification and blueprint literally: requested sections, workflows, interactions, data, and design direction must appear in the UI.',
     'Use the supplied previous file contents as authoritative contracts. Do not invent exports, prop names, aliases, or alternate folders.',
+    'Treat each target file contract in the dependency manifest as immutable: preserve its planned imports, exports, props, providers, consumers, and responsibility.',
     'Only src/App.jsx integrates routes and only src/main.jsx mounts React. Do not create another router or application entry.',
     'Before returning, verify every rendered component is imported or declared and every imported symbol is exported by its real module.',
     'Never import a relative module unless that exact file exists in previous files, target files, or the blueprint file list. If you import ./routes/AppRoutes, then src/routes/AppRoutes.jsx must be generated or already present.',
@@ -103,16 +104,26 @@ function buildPreviousFileContext(files = [], targetFiles = [], blueprint = {}) 
 function prioritizePreviousFiles(files = [], targetFiles = [], blueprint = {}) {
   const targetSet = new Set((targetFiles || []).map(String));
   const blueprintFiles = new Map((blueprint.fileList || []).map((file) => [String(file.path || ''), file]));
-  const directDependencies = new Set(['package.json', 'src/index.css', 'src/data/mockData.js', 'src/components/AppShell.jsx', 'src/components/DataCard.jsx']);
+  const directDependencies = new Set(['package.json']);
+
+  const collectDependencies = (filePath) => {
+    const contract = blueprintFiles.get(filePath);
+    for (const dependency of contract?.dependsOn || []) {
+      const normalized = String(dependency);
+      if (directDependencies.has(normalized)) continue;
+      directDependencies.add(normalized);
+      collectDependencies(normalized);
+    }
+    for (const imported of contract?.imports || []) {
+      const importedPath = typeof imported === 'string' ? imported : imported?.path;
+      if (importedPath) directDependencies.add(String(importedPath));
+    }
+  };
 
   for (const target of targetSet) {
-    for (const dependency of blueprintFiles.get(target)?.dependsOn || []) directDependencies.add(String(dependency));
+    collectDependencies(target);
     if (target === 'src/App.jsx') {
       for (const route of blueprint.routes || []) directDependencies.add('src/pages/' + String(route.component || 'HomePage').replace(/[^A-Za-z0-9]/g, '') + '.jsx');
-    }
-    if (target.startsWith('src/pages/')) {
-      directDependencies.add('src/components/AppShell.jsx');
-      directDependencies.add('src/data/mockData.js');
     }
   } 
 

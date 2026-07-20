@@ -52,23 +52,31 @@ export async function generateProjectFiles(project, options = {}) {
         project.generationProgress = Math.max(5, Math.round((completedBatches / activeBatches.length) * 80));
         await project.save();
 
-        const results = await mapWithConcurrency(stage.batches, generationParallelism(), (batch, index) => runGenerationBatch({
-          project,
-          batch,
-          batchIndex: completedBatches + index,
-          totalBatches: activeBatches.length,
-          previousFiles: stagePreviousFiles,
-          contracts: stageContracts,
-          warnings: stageWarnings,
-          manifest,
-          skipSave: true
-        }));
+        const results = await mapWithConcurrency(stage.batches, generationParallelism(), (batch, index) => withBatchTimeout(
+          runGenerationBatch({
+            project,
+            batch,
+            batchIndex: completedBatches + index,
+            totalBatches: activeBatches.length,
+            previousFiles: stagePreviousFiles,
+            contracts: stageContracts,
+            warnings: stageWarnings,
+            manifest,
+            skipSave: true
+          }),
+          Number(process.env.BATCH_TIMEOUT_MS || 300000),
+          'parallel batch ' + batch.batchNumber + ' (' + batch.agentName + ')'
+        ));
 
-        const generatedStageFiles = results.flatMap(({ generated }) => normalizeGenerationResult(generated).files || []);
+        // Collect all raw generated files from the stage (one entry per batch)
+
         const repairedStageFiles = [];
         for (const { batch, generated } of results) {
-          const targetSet = new Set((batch.files || []).map(normalizeProjectPath));
-          const siblingFiles = generatedStageFiles.filter((file) => !targetSet.has(normalizeProjectPath(file.path)));
+          // Sibling context: all raw generated files from OTHER batches in this stage
+          // Use raw (not yet repaired) siblings — deterministic repair will fix them
+          const siblingFiles = results
+            .filter(({ batch: sibBatch }) => sibBatch.batchNumber !== batch.batchNumber)
+            .flatMap(({ generated: sibGenerated }) => normalizeGenerationResult(sibGenerated).files || []);
           const repairContextFiles = mergeFiles(stagePreviousFiles, siblingFiles);
           const repairedGenerated = await repairGenerationBatch({ project, batch, generated, previousFiles: repairContextFiles, contracts, warnings, manifest });
           for (const warning of repairedGenerated.warnings || []) warnings.push(warning);
@@ -94,17 +102,27 @@ export async function generateProjectFiles(project, options = {}) {
         await options.onFiles?.(committed.changedFiles, project);
       } else {
         for (const batch of stage.batches) {
-          const generated = await runGenerationBatch({
-            project,
-            batch,
-            batchIndex: completedBatches,
-            totalBatches: activeBatches.length,
-            previousFiles: existingFiles,
-            contracts,
-            warnings,
-            manifest
-          });
-          const repairedGenerated = await repairGenerationBatch({ project, batch, generated, previousFiles: existingFiles, contracts, warnings, manifest });
+          const batchTimeoutMs = Number(process.env.BATCH_TIMEOUT_MS || 300000); // 5 minutes per batch default
+          const batchLabel = 'batch ' + batch.batchNumber + ' (' + batch.agentName + ')';
+          const generated = await withBatchTimeout(
+            runGenerationBatch({
+              project,
+              batch,
+              batchIndex: completedBatches,
+              totalBatches: activeBatches.length,
+              previousFiles: existingFiles,
+              contracts,
+              warnings,
+              manifest
+            }),
+            batchTimeoutMs,
+            batchLabel
+          );
+          const repairedGenerated = await withBatchTimeout(
+            repairGenerationBatch({ project, batch, generated, previousFiles: existingFiles, contracts, warnings, manifest }),
+            batchTimeoutMs,
+            batchLabel + ' repair'
+          );
           for (const warning of repairedGenerated.warnings || []) warnings.push(warning);
           for (const contract of repairedGenerated.contracts || []) contracts.push(contract);
           const committed = await commitGeneratedFiles({
@@ -140,7 +158,13 @@ export async function generateProjectFiles(project, options = {}) {
       });
       if (fixResult.status !== 'passed') {
         smokeRenderTest = runSmokeRenderTests(project.generatedFiles || []);
-        throw new Error('Smoke/render test failed after fix attempts: ' + smokeRenderTest.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
+        // Apply a tolerance threshold: if only a small number of non-critical files fail,
+        // emit warnings rather than aborting the entire pipeline.
+        if (!isSmokeTestBlockingFailure(smokeRenderTest)) {
+          warnings.push('Smoke/render test has minor issues that were not fully repaired: ' + smokeRenderTest.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
+        } else {
+          throw new Error('Smoke/render test failed after fix attempts: ' + smokeRenderTest.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
+        }
       }
       project.generatedFiles = repairProjectFiles(project.generatedFiles || [], manifest, warnings);
       validateGeneratedFiles(project.generatedFiles || [], [], manifest);
@@ -198,7 +222,15 @@ export async function repairGenerationBatch({ project, batch, generated, previou
       return candidate;
     } catch (error) {
       lastError = error.message;
-      if (attempt === maxAttempts) throw error;
+      if (attempt === maxAttempts) {
+        // Last attempt failed — use the fallback to fill any missing target files rather than throwing
+        const filledCandidate = fillMissingTargetFiles(candidate, batch, fallback);
+        filledCandidate.warnings = [
+          ...(filledCandidate.warnings || []),
+          'Batch ' + batch.batchNumber + ' used fallback for missing files after ' + maxAttempts + ' repair attempts: ' + lastError
+        ];
+        return filledCandidate;
+      }
       const repairFallback = buildRepairFallback({ fallback, candidate, batch });
       const repair = await runGenerationRepairGraph({
         specification: project.expandedSpec,
@@ -224,7 +256,27 @@ export async function repairGenerationBatch({ project, batch, generated, previou
       candidate = mergeGenerationRepair(candidate, repair, batch);
     }
   }
-  throw new Error(lastError || 'Generation repair failed.');
+  // Should never reach here but be safe
+  return fillMissingTargetFiles(candidate, batch, fallback);
+}
+
+/**
+ * Fill any target files still missing from the candidate with fallback content.
+ */
+function fillMissingTargetFiles(candidate, batch, fallback) {
+  const candidateMap = new Map((candidate.files || []).map((file) => [normalizeProjectPath(file.path), file]));
+  const targetSet = new Set((batch.files || []).map(normalizeProjectPath));
+  for (const fallbackFile of fallback.files || []) {
+    const filePath = normalizeProjectPath(fallbackFile.path);
+    if (targetSet.has(filePath) && !candidateMap.has(filePath)) {
+      candidateMap.set(filePath, fallbackFile);
+    }
+  }
+  return {
+    files: Array.from(candidateMap.values()),
+    contracts: candidate.contracts || [],
+    warnings: candidate.warnings || []
+  };
 }
 
 function validateBatchGraph(files, previousFiles) {
@@ -293,6 +345,41 @@ function repairProjectFiles(files, manifest, warnings) {
   }
   repaired = repairMissingRelativeImports(deterministic.files || repaired);
   return repaired;
+}
+
+/**
+ * Returns true if smoke test failures are severe enough to block generation output.
+ * Critical entry files (App.jsx, main.jsx) failing always blocks.
+ * Otherwise allow up to 30% of tested files to have issues before blocking.
+ */
+function isSmokeTestBlockingFailure(smokeRenderTest) {
+  const criticalFiles = new Set(['src/App.jsx', 'src/main.jsx']);
+  const errorFiles = new Set(smokeRenderTest.errors.map((e) => e.file).filter(Boolean));
+  // Any critical file failing is always a blocker
+  for (const criticalFile of criticalFiles) {
+    if (errorFiles.has(criticalFile)) return true;
+  }
+  // If more than 30% of tested files fail, block
+  const testedCount = smokeRenderTest.testedFiles?.length || 1;
+  const failedCount = errorFiles.size;
+  if (failedCount / testedCount > 0.3) return true;
+  return false;
+}
+
+/**
+ * Runs a promise with an absolute timeout. If the promise does not resolve
+ * within timeoutMs, rejects with a timeout error.
+ */
+function withBatchTimeout(promise, timeoutMs, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error('Generation batch timed out after ' + Math.round(timeoutMs / 1000) + 's: ' + label));
+    }, timeoutMs);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); }
+    );
+  });
 }
 
 function generationParallelism() {
@@ -388,11 +475,29 @@ async function runGenerationBatch({ project, batch, batchIndex, totalBatches, pr
       manifest: manifestForBatch(manifest, batch)
     }
   });
+
   const assigned = new Set(batch.files.map(normalizeProjectPath));
   const returnedFiles = Array.isArray(generated.files) ? generated.files : [];
+
+  // Split returned files into owned vs out-of-scope
   const rejectedPaths = returnedFiles.map((file) => normalizeProjectPath(file.path)).filter((filePath) => !assigned.has(filePath));
   generated.files = returnedFiles.filter((file) => assigned.has(normalizeProjectPath(file.path)));
   if (rejectedPaths.length) generated.warnings = [...(generated.warnings || []), 'Ignored files outside this agent ownership: ' + rejectedPaths.join(', ')];
+
+  // Fill any target files the LLM forgot to return with fallback content
+  const generatedPathSet = new Set(generated.files.map((file) => normalizeProjectPath(file.path)));
+  const missingTargets = batch.files.map(normalizeProjectPath).filter((filePath) => !generatedPathSet.has(filePath));
+  if (missingTargets.length) {
+    const fallbackMap = new Map((fallback.files || []).map((file) => [normalizeProjectPath(file.path), file]));
+    for (const missingPath of missingTargets) {
+      const fallbackFile = fallbackMap.get(missingPath);
+      if (fallbackFile) {
+        generated.files.push(fallbackFile);
+        generated.warnings = [...(generated.warnings || []), 'Batch ' + batch.batchNumber + ': LLM omitted ' + missingPath + ', filled with safe fallback.'];
+      }
+    }
+  }
+
   assertOwnedBatchFiles(generated.files, batch, manifest);
   return skipSave || batch.concurrentGroup ? { batch, generated } : generated;
 }

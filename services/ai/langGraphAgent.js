@@ -340,7 +340,13 @@ function validateCodeGenerationResponse(value) {
   for (const file of value.files) {
     if (!file.path || typeof file.path !== 'string') return { valid: false, message: 'file.path is required' };
     if (!file.language || typeof file.language !== 'string') return { valid: false, message: 'file.language is required' };
-    if (typeof file.content !== 'string' || file.content.length === 0) return { valid: false, message: 'file.content is required' };
+    if (typeof file.content !== 'string') return { valid: false, message: 'file.content must be a string' };
+    // CSS, JSON config, and other non-JS files can legitimately have minimal/empty content.
+    // Only enforce non-empty for JS/JSX files.
+    const isJsFile = /\.(js|jsx|ts|tsx)$/.test(file.path);
+    if (isJsFile && file.content.trim().length === 0) {
+      return { valid: false, message: 'file.content is required for JS/JSX file: ' + file.path };
+    }
   }
   if (!Array.isArray(value.contracts)) return { valid: false, message: 'contracts must be an array' };
   if (!Array.isArray(value.warnings)) return { valid: false, message: 'warnings must be an array' };

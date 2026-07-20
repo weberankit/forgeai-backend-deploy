@@ -13,6 +13,8 @@
     "@babel/traverse": "^8.0.4",
     "@langchain/core": "^1.2.3",
     "@langchain/langgraph": "^1.4.8",
+    "@langfuse/core": "^5.9.1",
+    "@langfuse/langchain": "^5.9.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",

@@ -5,6 +5,7 @@ import { applyEditOperationsToFiles, validateEditOperations } from './editOperat
 import { runStaticValidation } from '../review/staticValidation.js';
 import { runFixLoop } from '../review/fixAgent.js';
 import { runEditGraph } from '../ai/langGraphAgent.js';
+import { isOpenAiCredentialError } from '../ai/openAiErrors.js';
 import { buildKnownPitfallsPrompt, retrieveVerifiedFixes } from '../memory/verifiedFixMemory.js';
 
 export async function applyNaturalLanguageEdit(project, message) {
@@ -61,7 +62,10 @@ async function produceEditChanges(project, message, targets) {
     targetFiles,
     dependencyContext,
     fallback: { changes: fallbackChanges, warnings: ['Edit LLM is unavailable; deterministic fallback was used.'] }
-  }).catch((error) => ({ changes: fallbackChanges, warnings: ['Edit LLM failed: ' + error.message] }));
+  }).catch((error) => {
+    if (isOpenAiCredentialError(error)) throw error;
+    return { changes: fallbackChanges, warnings: ['Edit LLM failed: ' + error.message] };
+  });
   const allowedTargets = new Set(targets);
   const changes = (result.changes || [])
     .filter((change) => change.operation === 'create' || change.changeType === 'create' || allowedTargets.has(change.path))

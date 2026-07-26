@@ -36,8 +36,6 @@ PORT=4000
 MONGODB_URI=mongodb://127.0.0.1:27017/ai_frontend_engineer
 CLIENT_ORIGIN=http://localhost:5173
 AI_PROVIDER=mock
-OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4.1-mini
 VISION_PROVIDER=mock
 MAX_IMAGE_SIZE_MB=5
 DEMO_MODE=false
@@ -46,7 +44,7 @@ VERCEL_TOKEN=
 VERCEL_TEAM_ID=
 ```
 
-`AI_PROVIDER=mock` is the default, so the app runs without an API key. Set `AI_PROVIDER=openai` and provide `OPENAI_API_KEY` to use real generation.
+The server does not read a shared OpenAI API key. Each browser tab supplies its user key through the `x-openai-api-key` header for AI routes. The frontend validates the key, stores it in `sessionStorage`, and removes it when that tab session ends.
 
 ## Visitor Continuity
 

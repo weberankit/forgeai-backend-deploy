@@ -1,6 +1,7 @@
 import { withCallLog } from '../observability/centralCallLogger.js';
 import { getTaskLlmConfig } from '../../config/taskLlmConfig.js';
 import { fetchLlmResponse } from './llmTransport.js';
+import { isOpenAiCredentialError } from './openAiErrors.js';
 import { buildVisionPrompt } from './prompts/visionPrompt.js';
 
 const fallbackReason = 'Unable to inspect pixels without configured vision provider. Treat as a sketch/reference.';
@@ -42,6 +43,7 @@ export async function describeImage(image) {
     const text = data.output_text || data.output?.flatMap((item) => item.content || []).map((part) => part.text || '').join('\n') || '';
     return normalizeVisionResult(parseJson(text), image, model);
   } catch (error) {
+    if (isOpenAiCredentialError(error)) throw error;
     return { ...fallback, warning: 'Vision analysis failed: ' + error.message };
   }
 }

@@ -10,6 +10,7 @@ import { parseStructuredResponse, validateBlueprint, validateExpansionSpec } fro
 import { withCallLog } from '../observability/centralCallLogger.js';
 import { getTaskLlmConfig } from '../../config/taskLlmConfig.js';
 import { fetchLlmResponse } from './llmTransport.js';
+import { isOpenAiCredentialError } from './openAiErrors.js';
 
 const AgentState = Annotation.Root({
   task: Annotation(),
@@ -273,6 +274,7 @@ async function callStructuredAgent({ operation, prompt, fallbackResult, validato
       if (provider !== 'openai' && onToken) onToken(raw);
       return parseStructuredResponse(raw, validator);
     } catch (error) {
+      if (isOpenAiCredentialError(error)) throw error;
       console.warn('LangGraph structured agent output failed', { operation, attempt, message: error.message });
       attemptPrompt = buildRetryPrompt(prompt, error);
       if (attempt === config.maxRetries) {

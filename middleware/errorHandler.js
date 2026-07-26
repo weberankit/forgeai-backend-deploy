@@ -6,7 +6,8 @@ export function errorHandler(error, req, res, next) {
     path: req.path,
     method: req.method,
     status,
-    message: error.message
+    message: error.message,
+    code: error.code
   });
-  res.status(status).json({ error: { message } });
+  res.status(status).json({ error: { message, ...(error.code ? { code: error.code } : {}) } });
 }

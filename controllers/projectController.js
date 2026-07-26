@@ -84,7 +84,7 @@ export async function expandProjectStream(req, res, next) {
     writeSse(res, 'final', { project: serializeProject(project), imageDescription });
     res.end();
   } catch (error) {
-    writeSse(res, 'error', { message: error.message });
+    writeSse(res, 'error', { message: error.message, code: error.code });
     res.end();
   }
 }
@@ -163,7 +163,7 @@ export async function planProjectStream(req, res, next) {
     writeSse(res, 'final', { project: serializeProject(project) });
     res.end();
   } catch (error) {
-    writeSse(res, 'error', { message: error.message });
+    writeSse(res, 'error', { message: error.message, code: error.code });
     res.end();
   }
 }
@@ -296,7 +296,7 @@ export async function generateProjectStream(req, res) {
     writeSse(res, 'final', { project: serializeProject(generated), files: generated.generatedFiles, generationPlan: getGenerationPlan(generated.blueprint || {}) });
     res.end();
   } catch (error) {
-    writeSse(res, 'error', { message: error.message });
+    writeSse(res, 'error', { message: error.message, code: error.code });
     res.end();
   }
 }

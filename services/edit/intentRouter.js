@@ -1,6 +1,7 @@
 import { withCallLog } from '../observability/centralCallLogger.js';
 import { getTaskLlmConfig } from '../../config/taskLlmConfig.js';
 import { fetchLlmResponse } from '../ai/llmTransport.js';
+import { isOpenAiCredentialError } from '../ai/openAiErrors.js';
 import { buildIntentPrompt } from '../ai/prompts/intentPrompt.js';
 
 const allowedIntents = new Set(['edit', 'explain', 'build', 'unknown']);
@@ -20,6 +21,7 @@ export async function routeChatIntent(message) {
         rememberIntent(text, intent);
         return intent;
       } catch (error) {
+        if (isOpenAiCredentialError(error)) throw error;
         console.warn('Intent classifier failed', { attempt, message: error.message });
       }
     }

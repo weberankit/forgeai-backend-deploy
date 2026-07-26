@@ -1,6 +1,7 @@
 import path from 'path';
 import { runStaticValidation } from '../review/staticValidation.js';
 import { runExplainGraph } from '../ai/langGraphAgent.js';
+import { isOpenAiCredentialError } from '../ai/openAiErrors.js';
 
 export async function explainProjectQuestion(project, question) {
   const files = project.generatedFiles || [];
@@ -41,7 +42,10 @@ export async function explainProjectQuestion(project, question) {
     question,
     graphSummary: buildGraphSummary({ files: relevant, graph, routeMap, stateFlow, question, mode, codeContext, presentation }),
     fallback
-  }).catch(() => fallback);
+  }).catch((error) => {
+    if (isOpenAiCredentialError(error)) throw error;
+    return fallback;
+  });
 }
 
 function buildGraphSummary({ files, graph, routeMap, stateFlow, question, mode, codeContext = [], presentation = 'summary' }) {

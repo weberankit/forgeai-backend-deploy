@@ -1,18 +1,19 @@
 import { LLM_PROFILES } from './llmProfiles.js';
-
-const supportedProviders = new Set(['mock', 'openai']);
+import { getRequestOpenAiApiKey } from '../context/requestLlmContext.js';
+import { httpError } from '../utils/httpError.js';
+import { OPENAI_API_KEY_REQUIRED } from '../services/ai/openAiErrors.js';
 
 export function getTaskLlmConfig(task) {
   const profile = LLM_PROFILES[task];
   if (!profile) throw new Error('Unknown LLM task: ' + task + '. Expected: ' + Object.keys(LLM_PROFILES).join(', '));
-  const provider = String(process.env.LLM_PROVIDER || process.env.AI_PROVIDER || profile.provider).toLowerCase();
-  if (!supportedProviders.has(provider)) throw new Error('Unsupported provider for ' + task + ': ' + provider);
+  const requestApiKey = getRequestOpenAiApiKey();
+  const provider = requestApiKey ? 'openai' : 'mock';
 
   return {
     task,
     description: profile.description,
     provider,
-    apiKey: process.env.LLM_API_KEY || process.env.OPENAI_API_KEY || '',
+    apiKey: requestApiKey,
     baseUrl: String(process.env.LLM_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, ''),
     model: profile.model,
     temperature: profile.temperature,
@@ -28,7 +29,13 @@ export function listTaskLlmConfigs() {
 }
 
 export function requireTaskLlmApiKey(config) {
-  if (config.provider === 'openai' && !config.apiKey) throw new Error('LLM API key required for task: ' + config.task);
+  if (config.provider === 'openai' && !config.apiKey) {
+    throw httpError(
+      401,
+      'Add your OpenAI API key in Settings to use AI features.',
+      OPENAI_API_KEY_REQUIRED
+    );
+  }
   return config.apiKey;
 }
 

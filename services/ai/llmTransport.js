@@ -1,11 +1,12 @@
 import { requireTaskLlmApiKey } from '../../config/taskLlmConfig.js';
+import { openAiCredentialError } from './openAiErrors.js';
 
 export async function fetchLlmResponse(config, body) {
   requireTaskLlmApiKey(config);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), config.timeoutMs);
   try {
-    return await fetch(config.baseUrl + '/responses', {
+    const response = await fetch(config.baseUrl + '/responses', {
       method: 'POST',
       headers: {
         Authorization: 'Bearer ' + config.apiKey,
@@ -19,6 +20,10 @@ export async function fetchLlmResponse(config, body) {
       }),
       signal: controller.signal
     });
+    if (response.status === 401 || response.status === 403) {
+      throw openAiCredentialError();
+    }
+    return response;
   } catch (error) {
     if (error.name === 'AbortError') {
       throw new Error('LLM request timed out after ' + config.timeoutMs + 'ms.');

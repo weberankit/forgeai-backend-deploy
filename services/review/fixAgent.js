@@ -4,6 +4,7 @@ import { runQualityReview } from './reviewAgent.js';
 import { runStaticValidation } from './staticValidation.js';
 import { storeVerifiedFixCandidate } from '../memory/verifiedFixMemory.js';
 import { runGenerationRepairGraph } from '../ai/langGraphAgent.js';
+import { isOpenAiCredentialError } from '../ai/openAiErrors.js';
 import { repairMissingRelativeImports } from '../generation/importRepair.js';
 import { languageForPath, normalizeProjectPath } from '../generation/pathSafety.js';
 import path from 'path';
@@ -71,7 +72,10 @@ export async function runFixLoop(project, { runtimeOutput = '', runtimeEvidence 
 }
 
 export async function produceFixes(project, review, attempt = 1) {
-  const llmFix = await produceDynamicLlmFixes(project, review, attempt).catch(() => null);
+  const llmFix = await produceDynamicLlmFixes(project, review, attempt).catch((error) => {
+    if (isOpenAiCredentialError(error)) throw error;
+    return null;
+  });
   if (llmFix?.changes?.length) return llmFix;
   const changes = [];
   const files = project.generatedFiles || [];

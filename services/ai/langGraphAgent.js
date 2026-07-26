@@ -17,6 +17,7 @@ const AgentState = Annotation.Root({
   project: Annotation(),
   prompt: Annotation(),
   imageDescription: Annotation(),
+  websiteContext: Annotation(),
   specification: Annotation(),
   clarification: Annotation(),
   blueprint: Annotation(),
@@ -74,11 +75,12 @@ const explainGraph = new StateGraph(AgentState)
   .addEdge('explain_agent', END)
   .compile();
 
-export async function runExpansionGraph({ prompt, imageDescription, fallback, onToken }) {
+export async function runExpansionGraph({ prompt, imageDescription, websiteContext, fallback, onToken }) {
   return runAgentGraph('expansion', expansionGraph, {
     task: 'expansion',
     prompt,
     imageDescription,
+    websiteContext,
     fallbackResult: fallback,
     onToken
   });
@@ -161,13 +163,18 @@ async function runAgentGraph(operation, graph, state) {
 }
 
 async function expansionNode(state) {
-  const prompt = buildExpansionPrompt({ prompt: state.prompt, imageDescription: state.imageDescription });
+  const prompt = buildExpansionPrompt({
+    prompt: state.prompt,
+    imageDescription: state.imageDescription,
+    websiteContext: state.websiteContext
+  });
   const result = await callStructuredAgent({
     operation: 'expansion',
     prompt,
     fallbackResult: state.fallbackResult,
     validator: validateExpansionSpec,
-    onToken: state.onToken
+    onToken: state.onToken,
+    inputImages: (state.websiteContext?.pages || []).map((page) => page.screenshot).filter(Boolean)
   });
   return { result };
 }
@@ -260,7 +267,7 @@ async function codeGenerationNode(state) {
   return { result };
 }
 
-async function callStructuredAgent({ operation, prompt, fallbackResult, validator, onToken }) {
+async function callStructuredAgent({ operation, prompt, fallbackResult, validator, onToken, inputImages = [] }) {
   const config = getTaskLlmConfig(operation);
   const { provider } = config;
   let attemptPrompt = prompt;
@@ -270,7 +277,7 @@ async function callStructuredAgent({ operation, prompt, fallbackResult, validato
         type: 'ai_call', operation, provider,
         model: provider === 'openai' ? config.model : 'local-fallback',
         metadata: { attempt, streaming: Boolean(onToken), promptLength: attemptPrompt.length, temperature: config.temperature }
-      }, () => provider === 'openai' ? callOpenAI(attemptPrompt, config, { onToken }) : JSON.stringify(fallbackResult));
+      }, () => provider === 'openai' ? callOpenAI(attemptPrompt, config, { onToken, inputImages }) : JSON.stringify(fallbackResult));
       if (provider !== 'openai' && onToken) onToken(raw);
       return parseStructuredResponse(raw, validator);
     } catch (error) {
@@ -289,8 +296,17 @@ async function callStructuredAgent({ operation, prompt, fallbackResult, validato
   }
 }
 
-async function callOpenAI(prompt, config, { onToken } = {}) {
-  const response = await fetchLlmResponse(config, { input: prompt, stream: Boolean(onToken) });
+async function callOpenAI(prompt, config, { onToken, inputImages = [] } = {}) {
+  const input = inputImages.length
+    ? [{
+        role: 'user',
+        content: [
+          { type: 'input_text', text: prompt },
+          ...inputImages.slice(0, 4).map((imageUrl) => ({ type: 'input_image', image_url: imageUrl, detail: 'high' }))
+        ]
+      }]
+    : prompt;
+  const response = await fetchLlmResponse(config, { input, stream: Boolean(onToken) });
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
     throw new Error(data.error?.message || 'OpenAI request failed');

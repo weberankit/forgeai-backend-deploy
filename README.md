@@ -38,6 +38,7 @@ CLIENT_ORIGIN=http://localhost:5173
 AI_PROVIDER=mock
 VISION_PROVIDER=mock
 MAX_IMAGE_SIZE_MB=5
+PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/google-chrome
 DEMO_MODE=false
 DEPLOY_PROVIDER=mock
 VERCEL_TOKEN=
@@ -45,6 +46,8 @@ VERCEL_TEAM_ID=
 ```
 
 The server does not read a shared OpenAI API key. Each browser tab supplies its user key through the `x-openai-api-key` header for AI routes. The frontend validates the key, stores it in `sessionStorage`, and removes it when that tab session ends.
+
+Website importing requires Chromium. Set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` when Chrome/Chromium is installed by the host, or run `npx playwright install chromium` for Playwright's managed browser.
 
 ## Visitor Continuity
 
@@ -84,6 +87,15 @@ GET    /api/projects/:projectId/deployments
 GET    /api/projects/deployments/:deploymentId/status
 GET    /api/projects/memory/verified-fixes
 ```
+
+### Website import
+
+```text
+POST   /api/website-import/discover
+POST   /api/website-import/capture
+```
+
+Discovery crawls at most 12 same-origin HTML pages and creates sequential thumbnails with one Playwright page. Capture revisits up to four selected pages and keeps screenshots, sanitized DOM, and computed styles in a short-lived visitor-bound server store. The expansion request sends only its capture ID; compact reference context is persisted with the project.
 
 ### Health
 

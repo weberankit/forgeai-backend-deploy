@@ -16,6 +16,11 @@ import { restoreLatestSnapshot } from '../services/review/versioningService.js';
 import { explainProjectQuestion } from '../services/explain/explainAgent.js';
 import { startDeployment, getDeployment } from '../services/deploy/deploymentService.js';
 import { retrieveVerifiedFixes } from '../services/memory/verifiedFixMemory.js';
+import { getWebsiteCapture } from '../services/website/websiteCaptureStore.js';
+import {
+  buildExpansionWebsiteContext,
+  buildGeneratorWebsiteReference
+} from '../services/website/websiteCaptureService.js';
 
 function serializeProject(project) {
   return project.toObject({ versionKey: false });
@@ -48,6 +53,16 @@ function startSse(res) {
   res.flushHeaders?.();
 }
 
+function websiteCaptureForRequest(req, prompt) {
+  const captureId = String(req.body?.websiteCaptureId || '').trim();
+  if (!captureId) return { websiteContext: null, websiteReference: null };
+  const capture = getWebsiteCapture(captureId, req.visitorId);
+  return {
+    websiteContext: buildExpansionWebsiteContext(capture, prompt),
+    websiteReference: buildGeneratorWebsiteReference(capture, prompt)
+  };
+}
+
 export async function expandProjectStream(req, res, next) {
   startSse(res);
   try {
@@ -58,7 +73,9 @@ export async function expandProjectStream(req, res, next) {
 
     const chat = await findVisitorChat(chatId, req.visitorId);
     const imageDescription = await describeImage(req.file);
-    const expandedSpec = await expandSpecification({ prompt, imageDescription, onToken: (token) => writeSse(res, 'token', { token }) });
+    const { websiteContext, websiteReference } = websiteCaptureForRequest(req, prompt);
+    const expandedSpec = await expandSpecification({ prompt, imageDescription, websiteContext, onToken: (token) => writeSse(res, 'token', { token }) });
+    if (websiteReference) expandedSpec.websiteReference = websiteReference;
 
     const project = await Project.create({
       projectId: randomUUID(),
@@ -67,6 +84,7 @@ export async function expandProjectStream(req, res, next) {
       name: expandedSpec.projectName,
       originalPrompt: prompt,
       imageMetadata: imageDescription?.metadata || null,
+      websiteReference,
       expandedSpec,
       approvalStatus: 'draft',
       status: 'spec_ready'
@@ -98,7 +116,9 @@ export async function expandProject(req, res, next) {
 
     const chat = await findVisitorChat(chatId, req.visitorId);
     const imageDescription = await describeImage(req.file);
-    const expandedSpec = await expandSpecification({ prompt, imageDescription });
+    const { websiteContext, websiteReference } = websiteCaptureForRequest(req, prompt);
+    const expandedSpec = await expandSpecification({ prompt, imageDescription, websiteContext });
+    if (websiteReference) expandedSpec.websiteReference = websiteReference;
 
     const project = await Project.create({
       projectId: randomUUID(),
@@ -107,6 +127,7 @@ export async function expandProject(req, res, next) {
       name: expandedSpec.projectName,
       originalPrompt: prompt,
       imageMetadata: imageDescription?.metadata || null,
+      websiteReference,
       expandedSpec,
       approvalStatus: 'draft',
       status: 'spec_ready'

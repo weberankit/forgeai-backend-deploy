@@ -3,6 +3,7 @@ import cors from 'cors';
 import chatRoutes from './routes/chatRoutes.js';
 import projectRoutes from './routes/projectRoutes.js';
 import llmRoutes from './routes/llmRoutes.js';
+import websiteImportRoutes from './routes/websiteImportRoutes.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { activityRequestLogger, ingestBrowserActivity } from './middleware/activityLogging.js';
 import { withRequestOpenAiCredentials } from './middleware/openAiCredentials.js';
@@ -26,6 +27,7 @@ app.get('/api/health', (req, res) => {
 
 app.use('/api/chats', chatRoutes);
 app.use('/api/llm', llmRoutes);
+app.use('/api/website-import', websiteImportRoutes);
 app.use('/api/projects', projectRoutes);
 app.use(errorHandler);
 

@@ -1,7 +1,13 @@
 import { runExpansionGraph, runPlanningGraph } from './langGraphAgent.js';
 
-export async function expandSpecification({ prompt, imageDescription, onToken }) {
-  return runExpansionGraph({ prompt, imageDescription, fallback: mockExpansion(prompt, imageDescription), onToken });
+export async function expandSpecification({ prompt, imageDescription, websiteContext, onToken }) {
+  return runExpansionGraph({
+    prompt,
+    imageDescription,
+    websiteContext,
+    fallback: mockExpansion(prompt, imageDescription, websiteContext),
+    onToken
+  });
 }
 
 export async function planFrontendProject({ specification, clarification, onToken }) {
@@ -15,10 +21,10 @@ function titleFromPrompt(prompt) {
   return words.length ? words.map((word) => word[0]?.toUpperCase() + word.slice(1)).join(' ') : 'Frontend Project';
 }
 
-function mockExpansion(prompt, imageDescription) {
+function mockExpansion(prompt, imageDescription, websiteContext) {
   const lower = String(prompt || '').toLowerCase();
   const projectName = titleFromPrompt(prompt);
-  const domain = inferDomain(lower);
+  const domain = websiteContext?.pages?.length ? inferWebsiteDomain(websiteContext) : inferDomain(lower);
   return {
     projectName,
     projectSummary: 'A frontend-only React application for: ' + prompt,
@@ -33,8 +39,32 @@ function mockExpansion(prompt, imageDescription) {
     responsiveRequirements: ['Mobile-first layout', 'Usable tablet and desktop layouts', 'Touch-friendly controls'],
     accessibilityRequirements: ['Semantic landmarks', 'Keyboard accessible controls', 'Visible focus states', 'Accessible form labels'],
     designDirection: [domain.design, 'Polished production-quality spacing and typography', imageDescription ? 'Reflect the uploaded reference image' : 'Derive a coherent visual system from the request'],
-    assumptions: ['The generated app is frontend-only', 'External services are represented by safe browser mocks'],
+    assumptions: [
+      'The generated app is frontend-only',
+      'External services are represented by safe browser mocks',
+      ...(websiteContext ? ['Selected website pages are used in ' + websiteContext.mode + ' mode.'] : [])
+    ],
     blockingQuestions: []
+  };
+}
+
+function inferWebsiteDomain(websiteContext) {
+  const routes = [...new Map(websiteContext.pages.map((page, index) => {
+    const rawPath = new URL(page.url).pathname || '/';
+    const path = rawPath === '/' ? '/' : rawPath.replace(/\/+$/, '');
+    const name = path === '/'
+      ? 'HomePage'
+      : path.split('/').filter(Boolean).map((part) => part.replace(/[^a-z0-9]+/gi, ' ').split(' ').filter(Boolean).map((word) => word[0].toUpperCase() + word.slice(1)).join('')).join('') + 'Page';
+    return [path, { path, component: name, purpose: page.title || 'Recreate selected website page ' + (index + 1) }];
+  })).values()];
+  return {
+    targetUsers: ['Visitors of the referenced website experience'],
+    routes,
+    components: ['AppShell', 'SiteHeader', 'ResponsiveNavigation', 'ContentSection', 'SiteFooter'],
+    features: ['Selected page navigation', 'Responsive cloned layouts', 'Reference-derived content sections'],
+    design: websiteContext.mode === 'reference'
+      ? 'A distinct visual system inspired by the selected website pages'
+      : 'A close visual and structural recreation of the selected website pages'
   };
 }
 

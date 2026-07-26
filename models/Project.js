@@ -96,6 +96,7 @@ const projectSchema = new mongoose.Schema(
     name: { type: String, required: true },
     originalPrompt: { type: String, required: true },
     imageMetadata: { type: mongoose.Schema.Types.Mixed, default: null },
+    websiteReference: { type: mongoose.Schema.Types.Mixed, default: null },
     expandedSpec: { type: mongoose.Schema.Types.Mixed, default: null },
     blueprint: { type: mongoose.Schema.Types.Mixed, default: null },
     generatedFiles: { type: [generatedFileSchema], default: [] },

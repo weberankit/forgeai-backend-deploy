@@ -26,14 +26,14 @@ import {
 } from '../controllers/projectController.js';
 import { requireVisitor } from '../middleware/visitor.js';
 import { uploadImage } from '../middleware/upload.js';
-import { requireOpenAiApiKey } from '../middleware/openAiCredentials.js';
+import { requireOpenAiApiKey, withRequestOpenAiCredentials } from '../middleware/openAiCredentials.js';
 
 const router = Router();
 router.use(requireVisitor);
 router.get('/memory/verified-fixes', getVerifiedFixSuggestions);
 router.get('/deployments/:deploymentId/status', getDeploymentStatus);
-router.post('/expand/stream', requireOpenAiApiKey, uploadImage.single('image'), expandProjectStream);
-router.post('/expand', requireOpenAiApiKey, uploadImage.single('image'), expandProject);
+router.post('/expand/stream', requireOpenAiApiKey, uploadImage.single('image'), withRequestOpenAiCredentials, expandProjectStream);
+router.post('/expand', requireOpenAiApiKey, uploadImage.single('image'), withRequestOpenAiCredentials, expandProject);
 router.post('/plan/stream', requireOpenAiApiKey, planProjectStream);
 router.post('/plan', requireOpenAiApiKey, planProject);
 router.get('/:projectId', getProject);

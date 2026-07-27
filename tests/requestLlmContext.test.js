@@ -7,6 +7,7 @@ import {
 import { getTaskLlmConfig } from '../config/taskLlmConfig.js';
 import { fetchLlmResponse } from '../services/ai/llmTransport.js';
 import { validateOpenAiKey } from '../controllers/llmController.js';
+import projectRoutes from '../routes/projectRoutes.js';
 
 const firstKey = 'sk-test-' + 'a'.repeat(32);
 const secondKey = 'sk-test-' + 'b'.repeat(32);
@@ -36,6 +37,21 @@ test('request OpenAI keys stay isolated across concurrent async work', async () 
   assert.equal(second.config.apiKey, secondKey);
   assert.equal(second.config.provider, 'openai');
   assert.equal(getRequestOpenAiApiKey(), '');
+});
+
+test('multipart expansion routes restore API-key context after upload parsing', () => {
+  for (const path of ['/expand/stream', '/expand']) {
+    const route = projectRoutes.stack.find((layer) => layer.route?.path === path)?.route;
+    assert.ok(route, 'Expected route ' + path);
+    const handlers = route.stack.map((layer) => layer.handle.name);
+    const uploadIndex = handlers.indexOf('multerMiddleware');
+    const contextIndex = handlers.indexOf('withRequestOpenAiCredentials');
+    const controllerIndex = handlers.indexOf(path.endsWith('/stream') ? 'expandProjectStream' : 'expandProject');
+
+    assert.ok(uploadIndex >= 0, 'Expected multipart parser on ' + path);
+    assert.ok(contextIndex > uploadIndex, 'Expected API-key context restoration after multipart parsing on ' + path);
+    assert.ok(controllerIndex > contextIndex, 'Expected expansion controller after API-key context restoration on ' + path);
+  }
 });
 
 test('server environment API keys are not selected as user credentials', () => {

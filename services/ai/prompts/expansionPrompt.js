@@ -7,7 +7,10 @@ Rules:
 - Generated applications use React.js with Vite, JavaScript, Tailwind CSS, and React Router when useful.
 - Redux Toolkit is included only when useful.
 - Do not propose generated Express backends, databases, authentication, or server architecture.
-- Infer requirements where possible and list only genuine blocking questions.
+- On an initial request, blockingQuestions must contain at least one concise, useful product or UX clarification question and not more than two-three; never return an empty list, even when reasonable defaults exist.
+- Include every additional question that would materially help shape pages, routes, user roles, data persistence, content, design direction, or the interaction flow.
+- Prefer questions about product purpose, target users, primary workflows, desired pages or content, and meaningful visual preferences.
+- If the user prompt already contains "Clarification:" or "Clarifications:", treat those answers as sufficient and return blockingQuestions as an empty array so planning can continue.
 - Treat routes as the authoritative page list. Every pages entry must have exactly one matching routes entry, and every routes entry must have exactly one matching pages entry.
 - Use the same component name in routes that planning should use for src/pages/<Component>.jsx.
 - Do not ask the user to choose router, state, styling, data-fetching, provider, or folder architecture; record product assumptions here and let the planner lock implementation architecture.

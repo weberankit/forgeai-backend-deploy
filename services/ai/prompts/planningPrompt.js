@@ -12,7 +12,9 @@ Rules:
 - List every browser npm package actually required by planned code in requiredDependencies. Do not list server packages.
 - Give every file one complete responsibility and explicit dependsOn paths. Never plan the same path twice.
 - Choose one immutable stackManifest. Use browser_router unless the specification explicitly requires data-router loaders/actions. Assign exactly one owner file for each app-wide provider/singleton.
-- Every file entry must declare its imports, exports, consumers, component props, and provider requirements. Imports and dependsOn must reference exact paths present in fileList.
+- Every file entry must declare its imports, exports, consumers, component props, and provider requirements.
+- fileList[*].imports and dependsOn must contain only exact internal generated-file paths present in fileList.
+- Never put react, react-dom, react-router-dom, lucide-react, or any other npm package specifier in fileList[*].imports or dependsOn. List npm packages only in requiredDependencies.
 - Every imported symbol must appear in the referenced file's exports. Every provider requirement must name a provider declared in stackManifest.providers, whose ownerFile must exist in fileList.
 - A file that imports another planned file must include that path in dependsOn. Do not create circular dependencies.
 - Plan package.json dependencies completely now. Later generation agents cannot add packages.

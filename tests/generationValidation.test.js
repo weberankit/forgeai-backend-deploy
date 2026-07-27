@@ -9,6 +9,8 @@ import { validateRouteIntegration } from '../services/review/routeValidation.js'
 import { runSmokeRenderTests } from '../services/review/testingAgent.js';
 import { expandSpecification, planFrontendProject } from '../services/ai/aiClient.js';
 import { buildCodeGenerationPrompt } from '../services/ai/prompts/codeGenerationPrompt.js';
+import { buildExpansionPrompt } from '../services/ai/prompts/expansionPrompt.js';
+import { buildPlanningPrompt } from '../services/ai/prompts/planningPrompt.js';
 import { validateBlueprint, validateExpansionSpec } from '../services/ai/parseStructuredResponse.js';
 
 test('code generation prompt preserves the standard implementation workflow', () => {
@@ -24,6 +26,21 @@ test('code generation prompt preserves the standard implementation workflow', ()
   assert.match(prompt, /only the final JSON output should be returned/);
   assert.match(prompt, /dependency list is locked/);
   assert.doesNotMatch(prompt, /You may add a browser-compatible npm dependency/);
+});
+
+test('expansion prompt always asks at least one useful initial clarification', () => {
+  const prompt = buildExpansionPrompt({ prompt: 'Build a customer portal.' });
+  assert.match(prompt, /blockingQuestions must contain at least one concise, useful product or UX clarification question/);
+  assert.match(prompt, /never return an empty list, even when reasonable defaults exist/);
+  assert.match(prompt, /Include every additional question that would materially help shape/);
+  assert.match(prompt, /return blockingQuestions as an empty array so planning can continue/);
+});
+
+test('planning prompt keeps npm packages outside the internal file dependency graph', () => {
+  const prompt = buildPlanningPrompt({ specification: {}, clarification: '' });
+  assert.match(prompt, /imports and dependsOn must contain only exact internal generated-file paths/);
+  assert.match(prompt, /Never put react, react-dom, react-router-dom, lucide-react/);
+  assert.match(prompt, /List npm packages only in requiredDependencies/);
 });
 
 test('deterministically removes duplicate declarations and redundant named exports', () => {

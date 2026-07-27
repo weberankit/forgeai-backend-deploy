@@ -175,50 +175,139 @@ export function redactCapturedAssetUrls(dom) {
   return sanitized;
 }
 
+// async function withBrowserPage(callback) {
+//   const executablePath = await resolveChromiumExecutable();
+//   let browser;
+//   try {
+//     browser = await chromium.launch({
+//       headless: true,
+//       ...(executablePath ? { executablePath } : {}),
+//       args: ['--disable-dev-shm-usage']
+//     });
+//   } catch (error) {
+//     throw httpError(503, 'Website capture browser is unavailable. Install Chromium or configure PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH.');
+//   }
+
+//   try {
+//     const context = await browser.newContext({
+//       viewport: { width: 1440, height: 900 },
+//       deviceScaleFactor: 1,
+//       colorScheme: 'light',
+//       reducedMotion: 'reduce',
+//       userAgent: 'ForgeAI-WebsiteImporter/1.0'
+//     });
+//     const checkedHosts = new Map();
+//     await context.route('**/*', async (route) => {
+//       const requestUrl = route.request().url();
+//       if (!/^https?:/i.test(requestUrl)) {
+//         await route.continue();
+//         return;
+//       }
+//       try {
+//         const host = new URL(requestUrl).hostname;
+//         if (!checkedHosts.has(host)) checkedHosts.set(host, assertPublicHttpUrl(requestUrl));
+//         await checkedHosts.get(host);
+//         await route.continue();
+//       } catch {
+//         await route.abort('blockedbyclient');
+//       }
+//     });
+//     const page = await context.newPage();
+//     page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
+//     page.setDefaultTimeout(8_000);
+//     page.on('dialog', (dialog) => void dialog.dismiss());
+//     return await callback(page);
+//   } finally {
+//     await browser.close();
+//   }
+// }
 async function withBrowserPage(callback) {
   const executablePath = await resolveChromiumExecutable();
   let browser;
-  try {
-    browser = await chromium.launch({
-      headless: true,
-      ...(executablePath ? { executablePath } : {}),
-      args: ['--disable-dev-shm-usage']
-    });
-  } catch (error) {
-    throw httpError(503, 'Website capture browser is unavailable. Install Chromium or configure PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH.');
-  }
 
   try {
-    const context = await browser.newContext({
+    console.log("Starting Chromium", {
+      customExecutablePath: executablePath || null,
+      playwrightExecutablePath: chromium.executablePath()
+    });
+
+    browser = await chromium.launch({
+      headless: true,
+
+      // Use a manually installed Chrome/Chromium only when found.
+      // Otherwise Playwright automatically uses its downloaded browser.
+      ...(executablePath ? { executablePath } : {}),
+
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage"
+      ]
+    });
+  } catch (error) {
+    // Important: expose the real cause in Render logs.
+    console.error("Chromium launch failed:", {
+      message: error?.message,
+      stack: error?.stack,
+      playwrightExecutablePath: chromium.executablePath(),
+      customExecutablePath: executablePath || null,
+      browsersPath: process.env.PLAYWRIGHT_BROWSERS_PATH || null
+    });
+
+    throw httpError(
+      503,
+      "Website capture browser could not start. Check the server logs for the Chromium launch error."
+    );
+  }
+
+  let context;
+
+  try {
+    context = await browser.newContext({
       viewport: { width: 1440, height: 900 },
       deviceScaleFactor: 1,
-      colorScheme: 'light',
-      reducedMotion: 'reduce',
-      userAgent: 'ForgeAI-WebsiteImporter/1.0'
+      colorScheme: "light",
+      reducedMotion: "reduce",
+      userAgent: "ForgeAI-WebsiteImporter/1.0"
     });
+
     const checkedHosts = new Map();
-    await context.route('**/*', async (route) => {
+
+    await context.route("**/*", async (route) => {
       const requestUrl = route.request().url();
+
       if (!/^https?:/i.test(requestUrl)) {
         await route.continue();
         return;
       }
+
       try {
         const host = new URL(requestUrl).hostname;
-        if (!checkedHosts.has(host)) checkedHosts.set(host, assertPublicHttpUrl(requestUrl));
+
+        if (!checkedHosts.has(host)) {
+          checkedHosts.set(host, assertPublicHttpUrl(requestUrl));
+        }
+
         await checkedHosts.get(host);
         await route.continue();
       } catch {
-        await route.abort('blockedbyclient');
+        await route.abort("blockedbyclient");
       }
     });
+
     const page = await context.newPage();
+
     page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
     page.setDefaultTimeout(8_000);
-    page.on('dialog', (dialog) => void dialog.dismiss());
+
+    page.on("dialog", (dialog) => {
+      void dialog.dismiss();
+    });
+
     return await callback(page);
   } finally {
-    await browser.close();
+    await context?.close().catch(() => undefined);
+    await browser?.close().catch(() => undefined);
   }
 }
 

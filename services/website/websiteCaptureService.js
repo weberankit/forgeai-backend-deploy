@@ -630,7 +630,7 @@ export async function discoverWebsite(inputUrl) {
     throw httpError(
       422,
       blockedPage?.error ||
-        'Pages were discovered, but the website blocked browser capture. Ask the user to upload screenshots instead.'
+        'Pages were discovered, but the website blocked browser capture..'
     );
   }
 

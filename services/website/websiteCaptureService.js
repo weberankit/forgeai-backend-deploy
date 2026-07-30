@@ -493,11 +493,16 @@ import {
 } from './publicUrl.js';
 import { httpError } from '../../utils/httpError.js';
 
-const MAX_DISCOVERED_PAGES = 12;
-const MAX_SELECTED_PAGES = 4;
+const DEFAULT_WEBSITE_IMPORT_MAX_PAGES = 5;
+const ABSOLUTE_WEBSITE_IMPORT_MAX_PAGES = 12;
+const MAX_DISCOVERED_PAGES =
+  resolveWebsiteImportMaxPages();
+const MAX_SELECTED_PAGES = MAX_DISCOVERED_PAGES;
 const MAX_CRAWL_DEPTH = 2;
 
 const NAVIGATION_TIMEOUT_MS = 18_000;
+const BRIGHT_DATA_NAVIGATION_TIMEOUT_MS =
+  2 * 60_000;
 const PAGE_DELAY_MS = 700;
 
 const MAX_SCREENSHOT_HEIGHT = 10_000;
@@ -512,8 +517,13 @@ const MAX_TEXT_CHARS = 8_000;
  * First attempts discovery using RecursiveUrlLoader.
  * If normal HTTP crawling is blocked, it falls back to Playwright.
  */
-export async function discoverWebsite(inputUrl) {
+export async function discoverWebsite(
+  inputUrl,
+  options = {}
+) {
   let discovered;
+
+  throwIfDiscoveryAborted(options.signal);
 
   try {
     const loader = new RecursiveUrlLoader(inputUrl, {
@@ -539,7 +549,10 @@ export async function discoverWebsite(inputUrl) {
       }
     );
 
-    discovered = await discoverWithBrowser(inputUrl);
+    discovered = await discoverWithBrowser(
+      inputUrl,
+      options
+    );
   }
 
   if (
@@ -550,74 +563,20 @@ export async function discoverWebsite(inputUrl) {
       'Recursive URL loading returned no pages. Falling back to browser-based discovery.'
     );
 
-    discovered = await discoverWithBrowser(inputUrl);
+    discovered = await discoverWithBrowser(
+      inputUrl,
+      options
+    );
   }
 
-  const thumbnails = await withBrowserPage(async (page) => {
-    const pages = [];
+  throwIfDiscoveryAborted(options.signal);
 
-    for (
-      const candidate of discovered.pages.slice(
-        0,
-        MAX_DISCOVERED_PAGES
-      )
-    ) {
-      try {
-        await visitPage(
-          page,
-          candidate.url,
-          discovered.origin
-        );
-
-        const finalUrl = normalizeInternalUrl(
-          page.url(),
-          discovered.sourceUrl,
-          discovered.origin
-        );
-
-        if (!finalUrl) {
-          continue;
-        }
-
-        const thumbnail = await page.screenshot({
-          type: 'jpeg',
-          quality: 52,
-          animations: 'disabled',
-          caret: 'hide',
-          scale: 'css'
-        });
-
-        pages.push({
-          ...candidate,
-          url: finalUrl,
-          path:
-            new URL(finalUrl).pathname +
-            new URL(finalUrl).search,
-          title:
-            (await page.title()).trim().slice(0, 180) ||
-            candidate.title,
-          thumbnail:
-            'data:image/jpeg;base64,' +
-            thumbnail.toString('base64')
-        });
-      } catch (error) {
-        console.warn('Website thumbnail capture failed.', {
-          url: candidate.url,
-          message: error?.message
-        });
-
-        pages.push({
-          ...candidate,
-          thumbnail: '',
-          error: safePageError(error)
-        });
-      }
-
-      await page.waitForTimeout(PAGE_DELAY_MS);
-    }
-
-    return pages;
-  });
+  const thumbnails = discovered.browserRendered
+    ? discovered.pages
+    : await captureWebsiteThumbnails(
+        discovered,
+        options
+      );
 
   const pages = dedupeByUrl(thumbnails).slice(
     0,
@@ -636,8 +595,112 @@ export async function discoverWebsite(inputUrl) {
 
   return {
     sourceUrl: discovered.sourceUrl,
+    maxSelectablePages: MAX_SELECTED_PAGES,
     pages
   };
+}
+
+async function captureWebsiteThumbnails(
+  discovered,
+  options = {}
+) {
+  const thumbnails = [];
+
+  for (
+    const candidate of discovered.pages.slice(
+      0,
+      MAX_DISCOVERED_PAGES
+    )
+  ) {
+    throwIfDiscoveryAborted(options.signal);
+
+    try {
+      const thumbnailPage =
+        await withBrowserPage(
+          async (
+            page,
+            { navigationTimeoutMs }
+          ) => {
+            await visitPage(
+              page,
+              candidate.url,
+              discovered.origin,
+              navigationTimeoutMs
+            );
+
+            const finalUrl = normalizeInternalUrl(
+              page.url(),
+              discovered.sourceUrl,
+              discovered.origin
+            );
+
+            if (!finalUrl) {
+              return null;
+            }
+
+            const thumbnail = await captureThumbnail(page);
+
+            return {
+              ...candidate,
+              url: finalUrl,
+              path:
+                new URL(finalUrl).pathname +
+                new URL(finalUrl).search,
+              title:
+                (await page.title()).trim().slice(0, 180) ||
+                candidate.title,
+              thumbnail
+            };
+          }
+        );
+
+      if (thumbnailPage) {
+        thumbnails.push(thumbnailPage);
+        await emitDiscoveredPage(
+          options,
+          thumbnailPage,
+          thumbnails.length
+        );
+      }
+    } catch (error) {
+      console.warn('Website thumbnail capture failed.', {
+        url: candidate.url,
+        message: error?.message
+      });
+
+      const failedPage = {
+        ...candidate,
+        thumbnail: '',
+        error: safePageError(error)
+      };
+
+      thumbnails.push(failedPage);
+      await emitDiscoveredPage(
+        options,
+        failedPage,
+        thumbnails.length
+      );
+    }
+
+    await waitBetweenBrowserPages();
+  }
+
+  return thumbnails;
+}
+
+async function captureThumbnail(page) {
+  const thumbnail = await page.screenshot({
+    type: 'jpeg',
+    quality: 52,
+    animations: 'disabled',
+    caret: 'hide',
+    scale: 'css'
+  });
+
+  return (
+    'data:image/jpeg;base64,' +
+    thumbnail.toString('base64')
+  );
 }
 
 /**
@@ -675,15 +738,25 @@ export async function captureWebsiteSelection({
   if (selected.length > MAX_SELECTED_PAGES) {
     throw httpError(
       400,
-      'Select no more than four website pages.'
+      `Select no more than ${MAX_SELECTED_PAGES} website pages.`
     );
   }
 
-  const pages = await withBrowserPage(async (page) => {
-    const captured = [];
+  const pages = [];
 
-    for (const url of selected) {
-      await visitPage(page, url, allowedOrigin);
+  for (const url of selected) {
+    const capturedPage =
+      await withBrowserPage(
+        async (
+          page,
+          { navigationTimeoutMs }
+        ) => {
+          await visitPage(
+            page,
+            url,
+            allowedOrigin,
+            navigationTimeoutMs
+          );
 
       const finalUrl = normalizeInternalUrl(
         page.url(),
@@ -705,7 +778,7 @@ export async function captureWebsiteSelection({
         pageData.dimensions
       );
 
-      captured.push({
+          return {
         url: finalUrl,
         path:
           new URL(finalUrl).pathname +
@@ -718,13 +791,13 @@ export async function captureWebsiteSelection({
           screenshot.buffer.toString('base64'),
         screenshotMetadata: screenshot.metadata,
         ...pageData
-      });
+          };
+        }
+      );
 
-      await page.waitForTimeout(PAGE_DELAY_MS);
-    }
-
-    return captured;
-  });
+    pages.push(capturedPage);
+    await waitBetweenBrowserPages();
+  }
 
   return {
     version: 1,
@@ -960,157 +1033,186 @@ export function redactCapturedAssetUrls(dom) {
  *
  * This is used when the RecursiveUrlLoader gets blocked.
  */
-async function discoverWithBrowser(inputUrl) {
+async function discoverWithBrowser(
+  inputUrl,
+  options = {}
+) {
   const source =
     await assertPublicHttpUrl(inputUrl);
 
   const sourceUrl = source.href;
   const origin = source.origin;
 
-  const pages = await withBrowserPage(
-    async (page) => {
-      const discovered = new Map();
+  const discovered = new Map();
 
-      const queued = new Set([
-        sourceUrl
-      ]);
+  const queued = new Set([
+    sourceUrl
+  ]);
 
-      const queue = [
-        {
-          url: sourceUrl,
-          depth: 0
-        }
-      ];
+  const queue = [
+    {
+      url: sourceUrl,
+      depth: 0
+    }
+  ];
 
-      while (
-        queue.length &&
-        discovered.size <
-          MAX_DISCOVERED_PAGES
-      ) {
-        const current = queue.shift();
+  while (
+    queue.length &&
+    discovered.size <
+      MAX_DISCOVERED_PAGES
+  ) {
+    throwIfDiscoveryAborted(options.signal);
 
-        if (
-          !current ||
-          current.depth >
-            MAX_CRAWL_DEPTH
-        ) {
-          continue;
-        }
+    const current = queue.shift();
 
-        try {
-          await visitPage(
+    if (
+      !current ||
+      current.depth >
+        MAX_CRAWL_DEPTH
+    ) {
+      continue;
+    }
+
+    try {
+      const pageResult =
+        await withBrowserPage(
+          async (
             page,
-            current.url,
-            origin
-          );
-
-          const finalUrl =
-            normalizeInternalUrl(
-              page.url(),
-              sourceUrl,
-              origin
+            { navigationTimeoutMs }
+          ) => {
+            await visitPage(
+              page,
+              current.url,
+              origin,
+              navigationTimeoutMs
             );
 
-          if (
-            !finalUrl ||
-            discovered.has(finalUrl)
-          ) {
-            continue;
-          }
-
-          const title =
-            (await page.title())
-              .trim()
-              .slice(0, 180) ||
-            new URL(finalUrl).pathname ||
-            'Untitled page';
-
-          discovered.set(finalUrl, {
-            url: finalUrl,
-            title,
-            depth: current.depth
-          });
-
-          if (
-            current.depth >=
-            MAX_CRAWL_DEPTH
-          ) {
-            continue;
-          }
-
-          const links =
-            await page.evaluate(() =>
-              [
-                ...document.querySelectorAll(
-                  'a[href]'
-                )
-              ]
-                .map(
-                  (anchor) =>
-                    anchor.href
-                )
-                .filter(Boolean)
-            );
-
-          for (const link of links) {
-            const normalized =
+            const finalUrl =
               normalizeInternalUrl(
-                link,
+                page.url(),
                 sourceUrl,
                 origin
               );
 
             if (
-              !normalized ||
-              discovered.has(normalized) ||
-              queued.has(normalized)
+              !finalUrl ||
+              discovered.has(finalUrl)
             ) {
-              continue;
+              return null;
             }
 
-            if (
-              queue.length >=
-              MAX_DISCOVERED_PAGES * 3
-            ) {
-              break;
-            }
+            const title =
+              (await page.title())
+                .trim()
+                .slice(0, 180) ||
+              new URL(finalUrl).pathname ||
+              'Untitled page';
 
-            queued.add(normalized);
+            const links =
+              current.depth >=
+              MAX_CRAWL_DEPTH
+                ? []
+                : await page.evaluate(() =>
+                    [
+                      ...document.querySelectorAll(
+                        'a[href]'
+                      )
+                    ]
+                      .map(
+                        (anchor) =>
+                          anchor.href
+                      )
+                      .filter(Boolean)
+                  );
 
-            queue.push({
-              url: normalized,
-              depth:
-                current.depth + 1
-            });
+            return {
+              url: finalUrl,
+              path:
+                new URL(finalUrl).pathname +
+                new URL(finalUrl).search,
+              title,
+              thumbnail:
+                await captureThumbnail(page),
+              links
+            };
           }
-        } catch (error) {
-          console.warn(
-            'Browser discovery skipped a page.',
-            {
-              url: current.url,
-              depth: current.depth,
-              message: error?.message
-            }
-          );
-
-          if (
-            current.depth === 0 &&
-            discovered.size === 0
-          ) {
-            throw error;
-          }
-        }
-
-        await page.waitForTimeout(
-          PAGE_DELAY_MS
         );
+
+      if (!pageResult) {
+        continue;
       }
 
-      return [
-        ...discovered.values()
-      ];
+      const { links, ...preview } = pageResult;
+
+      discovered.set(preview.url, {
+        ...preview,
+        depth: current.depth
+      });
+
+      await emitDiscoveredPage(
+        options,
+        {
+          ...preview,
+          depth: current.depth
+        },
+        discovered.size
+      );
+
+      for (const link of links) {
+        const normalized =
+          normalizeInternalUrl(
+            link,
+            sourceUrl,
+            origin
+          );
+
+        if (
+          !normalized ||
+          discovered.has(normalized) ||
+          queued.has(normalized)
+        ) {
+          continue;
+        }
+
+        if (
+          queue.length >=
+          MAX_DISCOVERED_PAGES * 3
+        ) {
+          break;
+        }
+
+        queued.add(normalized);
+
+        queue.push({
+          url: normalized,
+          depth:
+            current.depth + 1
+        });
+      }
+    } catch (error) {
+      console.warn(
+        'Browser discovery skipped a page.',
+        {
+          url: current.url,
+          depth: current.depth,
+          message: error?.message
+        }
+      );
+
+      if (
+        current.depth === 0 &&
+        discovered.size === 0
+      ) {
+        throw error;
+      }
     }
-  );
+
+    await waitBetweenBrowserPages();
+  }
+
+  const pages = [
+    ...discovered.values()
+  ];
 
   if (!pages.length) {
     throw httpError(
@@ -1122,95 +1224,82 @@ async function discoverWithBrowser(inputUrl) {
   return {
     sourceUrl,
     origin,
+    browserRendered: true,
     pages
   };
 }
 
 /**
- * Start Chromium and give one reusable Playwright page
- * to the supplied callback.
+ * Connect to Bright Data's remote Chrome when configured,
+ * otherwise start local Chromium for development.
  */
 async function withBrowserPage(callback) {
-  const executablePath =
-    await resolveChromiumExecutable();
-
   let browser;
+  let provider;
 
   try {
-    console.log('Starting Chromium', {
-      customExecutablePath:
-        executablePath || null,
+    const connection =
+      await connectWebsiteBrowser();
 
-      playwrightExecutablePath:
-        chromium.executablePath()
-    });
-
-    browser = await chromium.launch({
-      headless: true,
-
-      ...(executablePath
-        ? {
-            executablePath
-          }
-        : {}),
-
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage'
-      ]
-    });
+    browser = connection.browser;
+    provider = connection.provider;
   } catch (error) {
-    console.error(
-      'Chromium launch failed:',
-      {
-        message: error?.message,
-        stack: error?.stack,
-
-        playwrightExecutablePath:
-          chromium.executablePath(),
-
-        customExecutablePath:
-          executablePath || null,
-
-        browsersPath:
-          process.env
-            .PLAYWRIGHT_BROWSERS_PATH ||
-          null
-      }
-    );
+    if (error?.status) {
+      throw error;
+    }
 
     throw httpError(
       503,
-      'Website capture browser could not start. Check the server logs for the Chromium launch error.'
+      'Website capture browser could not connect. Check the server browser configuration.'
     );
   }
 
   let context;
+  let page;
 
   try {
-    context =
-      await browser.newContext({
-        viewport: {
-          width: 1440,
-          height: 900
-        },
+    const contextOptions = {
+      viewport: {
+        width: 1440,
+        height: 900
+      },
 
-        screen: {
-          width: 1440,
-          height: 900
-        },
+      screen: {
+        width: 1440,
+        height: 900
+      },
 
-        deviceScaleFactor: 1,
-        colorScheme: 'light',
-        reducedMotion: 'reduce',
-        locale: 'en-US',
+      deviceScaleFactor: 1,
+      colorScheme: 'light',
+      reducedMotion: 'reduce',
+      locale: 'en-US',
 
-        extraHTTPHeaders: {
-          'Accept-Language':
-            'en-US,en;q=0.9'
-        }
-      });
+      ...(provider === 'local'
+        ? {
+            extraHTTPHeaders: {
+              'Accept-Language':
+                'en-US,en;q=0.9'
+            }
+          }
+        : {})
+    };
+
+    if (provider === 'brightdata') {
+      page =
+        await browser.newPage(
+          contextOptions
+        );
+
+      context = page.context();
+    } else {
+      context =
+        await browser.newContext(
+          contextOptions
+        );
+
+      page =
+        await context.newPage();
+    }
 
     const checkedHosts = new Map();
 
@@ -1257,11 +1346,13 @@ async function withBrowserPage(callback) {
       }
     );
 
-    const page =
-      await context.newPage();
+    const navigationTimeoutMs =
+      provider === 'brightdata'
+        ? BRIGHT_DATA_NAVIGATION_TIMEOUT_MS
+        : NAVIGATION_TIMEOUT_MS;
 
     page.setDefaultNavigationTimeout(
-      NAVIGATION_TIMEOUT_MS
+      navigationTimeoutMs
     );
 
     page.setDefaultTimeout(8_000);
@@ -1273,7 +1364,10 @@ async function withBrowserPage(callback) {
       }
     );
 
-    return await callback(page);
+    return await callback(page, {
+      provider,
+      navigationTimeoutMs
+    });
   } finally {
     await context
       ?.close()
@@ -1285,13 +1379,123 @@ async function withBrowserPage(callback) {
   }
 }
 
+async function connectWebsiteBrowser() {
+  const config =
+    resolveWebsiteBrowserConfig();
+
+  if (
+    config.provider ===
+    'brightdata'
+  ) {
+    console.log(
+      'Connecting to Bright Data Browser API.'
+    );
+
+    try {
+      const browser =
+        await chromium.connectOverCDP(
+          config.endpoint
+        );
+
+      return {
+        browser,
+        provider:
+          config.provider
+      };
+    } catch (error) {
+      // Playwright connection errors may contain the WebSocket URL,
+      // including credentials, so never log the raw error here.
+      console.error(
+        'Bright Data Browser API connection failed.',
+        {
+          name:
+            error?.name || 'Error',
+          code:
+            error?.code || null,
+          reason:
+            redactBrowserConnectionError(
+              error,
+              config.endpoint
+            )
+        }
+      );
+
+      throw httpError(
+        503,
+        'Bright Data Browser API could not connect. Check the configured endpoint and credentials.'
+      );
+    }
+  }
+
+  const executablePath =
+    await resolveChromiumExecutable();
+
+  try {
+    console.log('Starting local Chromium', {
+      customExecutablePath:
+        executablePath || null,
+
+      playwrightExecutablePath:
+        chromium.executablePath()
+    });
+
+    const browser =
+      await chromium.launch({
+        headless: true,
+
+        ...(executablePath
+          ? {
+              executablePath
+            }
+          : {}),
+
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage'
+        ]
+      });
+
+    return {
+      browser,
+      provider: 'local'
+    };
+  } catch (error) {
+    console.error(
+      'Local Chromium launch failed:',
+      {
+        message: error?.message,
+        stack: error?.stack,
+
+        playwrightExecutablePath:
+          chromium.executablePath(),
+
+        customExecutablePath:
+          executablePath || null,
+
+        browsersPath:
+          process.env
+            .PLAYWRIGHT_BROWSERS_PATH ||
+          null
+      }
+    );
+
+    throw httpError(
+      503,
+      'Website capture browser could not start. Check the server logs for the Chromium launch error.'
+    );
+  }
+}
+
 /**
  * Navigate to one website page and validate its HTTP response.
  */
 async function visitPage(
   page,
   url,
-  allowedOrigin
+  allowedOrigin,
+  navigationTimeoutMs =
+    NAVIGATION_TIMEOUT_MS
 ) {
   await assertPublicHttpUrl(url, {
     allowedOrigin
@@ -1303,7 +1507,7 @@ async function visitPage(
       waitUntil:
         'domcontentloaded',
       timeout:
-        NAVIGATION_TIMEOUT_MS
+        navigationTimeoutMs
     }
   );
 
@@ -2055,6 +2259,142 @@ async function resolveChromiumExecutable() {
   return undefined;
 }
 
+function waitBetweenBrowserPages() {
+  return new Promise((resolve) => {
+    setTimeout(resolve, PAGE_DELAY_MS);
+  });
+}
+
+async function emitDiscoveredPage(
+  options,
+  page,
+  index
+) {
+  throwIfDiscoveryAborted(options.signal);
+
+  await options.onPage?.({
+    page,
+    index,
+    maxPages: MAX_DISCOVERED_PAGES
+  });
+}
+
+function throwIfDiscoveryAborted(signal) {
+  if (!signal?.aborted) {
+    return;
+  }
+
+  const error = new Error(
+    'Website discovery was cancelled.'
+  );
+  error.name = 'AbortError';
+  throw error;
+}
+
+export function resolveWebsiteImportMaxPages(
+  env = process.env
+) {
+  const rawValue = String(
+    env.WEBSITE_IMPORT_MAX_PAGES ?? ''
+  ).trim();
+
+  if (!rawValue) {
+    return DEFAULT_WEBSITE_IMPORT_MAX_PAGES;
+  }
+
+  const configured = Number(rawValue);
+
+  if (!Number.isFinite(configured)) {
+    return DEFAULT_WEBSITE_IMPORT_MAX_PAGES;
+  }
+
+  return Math.max(
+    1,
+    Math.min(
+      ABSOLUTE_WEBSITE_IMPORT_MAX_PAGES,
+      Math.trunc(configured)
+    )
+  );
+}
+
+export function redactBrowserConnectionError(
+  error,
+  endpoint
+) {
+  let message = String(
+    error?.message ||
+      'Browser connection failed.'
+  );
+
+  try {
+    const parsed = new URL(endpoint);
+    const sensitiveValues = [
+      endpoint,
+      parsed.username,
+      parsed.password
+    ].filter(Boolean);
+
+    for (const value of sensitiveValues) {
+      message = message
+        .split(value)
+        .join('[redacted]');
+    }
+  } catch {
+    // Configuration validation reports malformed endpoints separately.
+  }
+
+  return message
+    .replace(
+      /wss:\/\/[^@\s]+@/gi,
+      'wss://[redacted]@'
+    )
+    .slice(0, 500);
+}
+
+export function resolveWebsiteBrowserConfig(
+  env = process.env
+) {
+  const endpoint = String(
+    env
+      .BRIGHT_DATA_BROWSER_WS_ENDPOINT ||
+      ''
+  ).trim();
+
+  if (!endpoint) {
+    return {
+      provider: 'local',
+      endpoint: ''
+    };
+  }
+
+  let parsed;
+
+  try {
+    parsed = new URL(endpoint);
+  } catch {
+    throw httpError(
+      503,
+      'BRIGHT_DATA_BROWSER_WS_ENDPOINT must be a valid WebSocket URL.'
+    );
+  }
+
+  if (
+    parsed.protocol !== 'wss:' ||
+    !parsed.username ||
+    !parsed.password
+  ) {
+    throw httpError(
+      503,
+      'BRIGHT_DATA_BROWSER_WS_ENDPOINT must use wss and include Browser API credentials.'
+    );
+  }
+
+  return {
+    provider: 'brightdata',
+    endpoint
+  };
+}
+
 function normalizeMode(mode) {
   return String(mode || '')
     .toLowerCase() === 'reference'
@@ -2144,5 +2484,3 @@ function safePageError(error) {
 
   return 'Page could not be rendered.';
 }
-
-

@@ -1,4 +1,10 @@
-import { discoverWebsite, captureWebsiteSelection, summarizeCaptureForClient } from '../services/website/websiteCaptureService.js';
+import { once } from 'node:events';
+import {
+  discoverWebsite,
+  captureWebsiteSelection,
+  resolveWebsiteImportMaxPages,
+  summarizeCaptureForClient
+} from '../services/website/websiteCaptureService.js';
 import { storeWebsiteCapture } from '../services/website/websiteCaptureStore.js';
 import { httpError } from '../utils/httpError.js';
 
@@ -14,6 +20,112 @@ export async function discoverWebsitePages(req, res, next) {
     res.setHeader('Cache-Control', 'no-store');
     res.json(result);
   } catch (error) {
+    next(error);
+  }
+}
+
+export async function streamWebsitePages(
+  req,
+  res,
+  next
+) {
+  const url = String(
+    req.body?.url || ''
+  ).trim();
+
+  if (!url) {
+    next(httpError(400, 'Website URL is required.'));
+    return;
+  }
+
+  try {
+    await runWebsiteJob(
+      req.visitorId,
+      async () => {
+        res.status(200);
+        res.setHeader(
+          'Content-Type',
+          'application/x-ndjson; charset=utf-8'
+        );
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.flushHeaders();
+
+        const abortController =
+          new AbortController();
+        const abortOnClose = () => {
+          if (!res.writableEnded) {
+            abortController.abort();
+          }
+        };
+        res.once('close', abortOnClose);
+
+        const heartbeat = setInterval(() => {
+          if (!res.destroyed) {
+            res.write(
+              JSON.stringify({
+                type: 'heartbeat'
+              }) + '\n'
+            );
+          }
+        }, 15_000);
+        heartbeat.unref?.();
+
+        try {
+          await writeStreamEvent(res, {
+            type: 'start',
+            sourceUrl: url,
+            maxPages:
+              resolveWebsiteImportMaxPages()
+          });
+
+          const result = await discoverWebsite(
+            url,
+            {
+              signal: abortController.signal,
+              onPage: async (progress) => {
+                await writeStreamEvent(res, {
+                  type: 'page',
+                  ...progress
+                });
+              }
+            }
+          );
+
+          await writeStreamEvent(res, {
+            type: 'complete',
+            result
+          });
+        } catch (error) {
+          if (
+            !abortController.signal.aborted &&
+            !res.destroyed
+          ) {
+            await writeStreamEvent(res, {
+              type: 'error',
+              status: error?.status || 500,
+              message:
+                error?.message ||
+                'Website discovery failed.'
+            });
+          }
+        } finally {
+          clearInterval(heartbeat);
+          res.off('close', abortOnClose);
+          if (!res.writableEnded) {
+            res.end();
+          }
+        }
+      }
+    );
+  } catch (error) {
+    if (res.headersSent) {
+      if (!res.writableEnded) {
+        res.end();
+      }
+      return;
+    }
+
     next(error);
   }
 }
@@ -43,5 +155,22 @@ async function runWebsiteJob(visitorId, callback) {
   } finally {
     activeVisitors.delete(visitorId);
     activeJobs -= 1;
+  }
+}
+
+async function writeStreamEvent(res, event) {
+  if (res.destroyed || res.writableEnded) {
+    return;
+  }
+
+  const accepted = res.write(
+    JSON.stringify(event) + '\n'
+  );
+
+  if (!accepted) {
+    await Promise.race([
+      once(res, 'drain'),
+      once(res, 'close')
+    ]);
   }
 }

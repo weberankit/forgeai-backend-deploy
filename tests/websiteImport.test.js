@@ -10,6 +10,9 @@ import {
   buildExpansionWebsiteContext,
   buildGeneratorWebsiteReference,
   redactCapturedAssetUrls,
+  redactBrowserConnectionError,
+  resolveWebsiteBrowserConfig,
+  resolveWebsiteImportMaxPages,
   resolveWebsiteMode
 } from '../services/website/websiteCaptureService.js';
 import { buildCodeGenerationPrompt } from '../services/ai/prompts/codeGenerationPrompt.js';
@@ -39,6 +42,91 @@ test('public URL validation blocks local and reserved networks', async () => {
   assert.equal(isPrivateOrReservedIp('93.184.216.34'), false);
   assert.equal(isPrivateOrReservedIp('::1'), true);
   assert.equal(isPrivateOrReservedIp('::ffff:7f00:1'), true);
+});
+
+test('website browser configuration prefers Bright Data when its endpoint is configured', () => {
+  assert.deepEqual(
+    resolveWebsiteBrowserConfig({}),
+    {
+      provider: 'local',
+      endpoint: ''
+    }
+  );
+
+  const endpoint =
+    'wss://browser-user:browser-password@brd.superproxy.io:9222';
+
+  assert.deepEqual(
+    resolveWebsiteBrowserConfig({
+      BRIGHT_DATA_BROWSER_WS_ENDPOINT:
+        endpoint
+    }),
+    {
+      provider: 'brightdata',
+      endpoint
+    }
+  );
+
+  assert.throws(
+    () =>
+      resolveWebsiteBrowserConfig({
+        BRIGHT_DATA_BROWSER_WS_ENDPOINT:
+          'ws://brd.superproxy.io:9222'
+      }),
+    /must use wss and include Browser API credentials/
+  );
+});
+
+test('browser connection errors retain the cause without exposing credentials', () => {
+  const endpoint =
+    'wss://browser-user:browser-password@brd.superproxy.io:9222';
+  const safeMessage =
+    redactBrowserConnectionError(
+      new Error(
+        `Unexpected server response: 403 while connecting to ${endpoint}`
+      ),
+      endpoint
+    );
+
+  assert.match(
+    safeMessage,
+    /Unexpected server response: 403/
+  );
+  assert.doesNotMatch(
+    safeMessage,
+    /browser-user|browser-password/
+  );
+});
+
+test('website import page limit defaults to five and stays within safe bounds', () => {
+  assert.equal(
+    resolveWebsiteImportMaxPages({}),
+    5
+  );
+  assert.equal(
+    resolveWebsiteImportMaxPages({
+      WEBSITE_IMPORT_MAX_PAGES: ''
+    }),
+    5
+  );
+  assert.equal(
+    resolveWebsiteImportMaxPages({
+      WEBSITE_IMPORT_MAX_PAGES: '3'
+    }),
+    3
+  );
+  assert.equal(
+    resolveWebsiteImportMaxPages({
+      WEBSITE_IMPORT_MAX_PAGES: '0'
+    }),
+    1
+  );
+  assert.equal(
+    resolveWebsiteImportMaxPages({
+      WEBSITE_IMPORT_MAX_PAGES: '100'
+    }),
+    12
+  );
 });
 
 test('internal URL normalization removes tracking and filters unsafe page targets', () => {

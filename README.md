@@ -39,6 +39,8 @@ AI_PROVIDER=mock
 VISION_PROVIDER=mock
 MAX_IMAGE_SIZE_MB=5
 PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/google-chrome
+BRIGHT_DATA_BROWSER_WS_ENDPOINT=wss://BRIGHT_DATA_USERNAME:BRIGHT_DATA_PASSWORD@brd.superproxy.io:9222
+WEBSITE_IMPORT_MAX_PAGES=5
 DEMO_MODE=false
 DEPLOY_PROVIDER=mock
 VERCEL_TOKEN=
@@ -47,7 +49,11 @@ VERCEL_TEAM_ID=
 
 The server does not read a shared OpenAI API key. Each browser tab supplies its user key through the `x-openai-api-key` header for AI routes. The frontend validates the key, stores it in `sessionStorage`, and removes it when that tab session ends.
 
-Website importing requires Chromium. Set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` when Chrome/Chromium is installed by the host, or run `npx playwright install chromium` for Playwright's managed browser.
+Website discovery first uses the lightweight recursive HTTP loader. If that is blocked, it falls back to browser discovery. Set `BRIGHT_DATA_BROWSER_WS_ENDPOINT` as a deployment secret to use Bright Data remote Chrome for browser discovery, thumbnails, and selected-page capture. The endpoint is sensitive because it contains credentials and must never be committed or exposed to the frontend.
+
+`WEBSITE_IMPORT_MAX_PAGES` controls both the number of preview pages shown and the maximum number of pages the user can select. It defaults to `5` and is clamped between `1` and `12`. Browser fallback discovery reuses each session's rendered page for its thumbnail, so Bright Data usage is approximately the preview limit plus the number of selected pages.
+
+Without a Bright Data endpoint, browser work uses local Chromium. Set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` when Chrome/Chromium is installed by the host, or run `npx playwright install chromium` for Playwright's managed browser.
 
 ## Visitor Continuity
 
@@ -92,10 +98,11 @@ GET    /api/projects/memory/verified-fixes
 
 ```text
 POST   /api/website-import/discover
+POST   /api/website-import/discover-stream
 POST   /api/website-import/capture
 ```
 
-Discovery crawls at most 12 same-origin HTML pages and creates sequential thumbnails with one Playwright page. Capture revisits up to four selected pages and keeps screenshots, sanitized DOM, and computed styles in a short-lived visitor-bound server store. The expansion request sends only its capture ID; compact reference context is persisted with the project.
+Discovery is capped by `WEBSITE_IMPORT_MAX_PAGES` and follows safe same-origin HTML links. The streaming route emits newline-delimited `start`, `page`, and `complete` events so the frontend can display each thumbnail immediately while keeping selection disabled until completion. Capture revisits only the selected pages and keeps screenshots, sanitized DOM, and computed styles in a short-lived visitor-bound server store. The expansion request sends only its capture ID; compact reference context is persisted with the project.
 
 ### Health
 

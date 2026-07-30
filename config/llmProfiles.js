@@ -137,8 +137,8 @@ const STANDARD_LLM_PROFILES = Object.freeze({
 const DEEP_LLM_PROFILES = Object.freeze({
   ...STANDARD_LLM_PROFILES,
   code_generation: profile('Generate complete frontend source files with maximum quality', 'gpt-5.2', undefined, 16000),
-  generation_repair: profile('Repair invalid or incomplete generated files with maximum quality', 'gpt-5.2', undefined, 16000),
-  edit: profile('Apply requested edits to generated files with maximum quality', 'gpt-5.2', undefined, 16000)
+ // generation_repair: profile('Repair invalid or incomplete generated files with maximum quality', 'gpt-5.2', undefined, 16000),
+ // edit: profile('Apply requested edits to generated files with maximum quality', 'gpt-5.2', undefined, 16000)
 });
 
 export const LLM_QUALITY_PROFILES = Object.freeze({

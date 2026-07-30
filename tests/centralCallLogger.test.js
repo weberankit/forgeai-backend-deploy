@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { withCallLog } from '../services/observability/centralCallLogger.js';
+import { normalizeOpenAiUsage } from '../services/observability/langfuseTracing.js';
 
 test('central logger records nested call lifecycle and redacts sensitive metadata', async () => {
   const logPath = path.join(os.tmpdir(), 'forgeai-call-log-' + process.pid + '.jsonl');
@@ -24,4 +25,19 @@ test('central logger records nested call lifecycle and redacts sensitive metadat
   assert.equal(events[2].metadata.promptLength, 15);
   await rm(logPath, { force: true });
   delete process.env.AI_CALL_LOG_PATH;
+});
+
+test('Langfuse usage normalization records counts without request content', () => {
+  assert.deepEqual(normalizeOpenAiUsage({
+    input_tokens: 120,
+    output_tokens: 45,
+    total_tokens: 165,
+    input: 'must not be copied',
+    output: 'must not be copied'
+  }), {
+    promptTokens: 120,
+    completionTokens: 45,
+    totalTokens: 165
+  });
+  assert.deepEqual(normalizeOpenAiUsage(null), {});
 });

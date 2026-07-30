@@ -16,7 +16,8 @@ export async function fetchLlmResponse(config, body) {
         model: config.model,
         temperature: config.temperature,
         max_output_tokens: config.maxOutputTokens,
-        ...body
+        ...body,
+        store: false
       }),
       signal: controller.signal
     });

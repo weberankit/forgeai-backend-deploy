@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { withLangfuseObservation } from './langfuseTracing.js';
 
 const serviceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_LOG_PATH = path.resolve(serviceDirectory, '..', '..', 'logs', 'ai-agent-calls.jsonl');
@@ -13,13 +14,18 @@ export function centralCallLogPath() {
   return path.resolve(process.env.AI_CALL_LOG_PATH || DEFAULT_LOG_PATH);
 }
 
-export async function withCallLog({ type, operation, provider, model, parentCallId, metadata }, callback) {
+export async function withCallLog({ type, operation, provider, model, parentCallId, metadata, input }, callback) {
   const callId = randomUUID();
   parentCallId ||= callContext.getStore()?.callId;
   const startedAt = new Date();
   await writeCallEvent({ timestamp: startedAt.toISOString(), event: 'started', type, callId, parentCallId, operation, provider, model, metadata });
   try {
-    const result = await callContext.run({ callId }, () => callback({ callId }));
+    const result = await withLangfuseObservation({
+      type, operation, provider, model, metadata: sanitize(metadata), input
+    }, (telemetry) => callContext.run(
+      { callId },
+      () => callback({ callId, ...telemetry })
+    ));
     await writeCallEvent({ timestamp: new Date().toISOString(), event: 'completed', type, callId, parentCallId, operation, provider, model, durationMs: Date.now() - startedAt.getTime(), metadata });
     return result;
   } catch (error) {

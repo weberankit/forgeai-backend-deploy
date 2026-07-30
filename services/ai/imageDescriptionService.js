@@ -16,10 +16,12 @@ export async function describeImage(image) {
   try {
     const { model } = config;
     const dataUrl = 'data:' + image.mimetype + ';base64,' + image.buffer.toString('base64');
-    const response = await withCallLog({
+    const data = await withCallLog({
       type: 'ai_call', operation: 'image_description', provider: 'openai', model,
-      metadata: { mimeType: image.mimetype, imageBytes: image.size }
-    }, () => fetchLlmResponse(config, {
+      input: { prompt: buildVisionPrompt(), image: { mimeType: image.mimetype, imageBytes: image.size } },
+      metadata: { mimeType: image.mimetype, imageBytes: image.size, temperature: config.temperature, maxOutputTokens: config.maxOutputTokens }
+    }, async ({ recordUsage }) => {
+      const response = await fetchLlmResponse(config, {
         input: [{
           role: 'user',
           content: [
@@ -34,12 +36,15 @@ export async function describeImage(image) {
             }
           ]
         }]
-    }));
-    if (!response.ok) {
-      const data = await response.json().catch(() => ({}));
-      throw new Error(data.error?.message || 'OpenAI vision request failed');
-    }
-    const data = await response.json();
+      });
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error?.message || 'OpenAI vision request failed');
+      }
+      const responseData = await response.json();
+      recordUsage(responseData.usage);
+      return responseData;
+    });
     const text = data.output_text || data.output?.flatMap((item) => item.content || []).map((part) => part.text || '').join('\n') || '';
     return normalizeVisionResult(parseJson(text), image, model);
   } catch (error) {

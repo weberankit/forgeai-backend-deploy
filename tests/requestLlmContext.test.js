@@ -94,6 +94,29 @@ test('OpenAI authentication failures expose a safe credential error code', async
   }
 });
 
+test('all Responses API calls disable OpenAI response storage', async () => {
+  const previousFetch = globalThis.fetch;
+  let requestBody;
+  globalThis.fetch = async (url, options) => {
+    requestBody = JSON.parse(options.body);
+    return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+  try {
+    await fetchLlmResponse({
+      provider: 'openai',
+      task: 'expansion',
+      apiKey: firstKey,
+      baseUrl: 'https://api.openai.test/v1',
+      model: 'test-model',
+      timeoutMs: 1_000
+    }, { input: 'private prompt', store: true });
+
+    assert.equal(requestBody.store, false);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
 test('key validation uses the request key and prevents response caching', async () => {
   const previousFetch = globalThis.fetch;
   let authorization = '';

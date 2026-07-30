@@ -276,8 +276,9 @@ async function callStructuredAgent({ operation, prompt, fallbackResult, validato
       const raw = await withCallLog({
         type: 'ai_call', operation, provider,
         model: provider === 'openai' ? config.model : 'local-fallback',
-        metadata: { attempt, streaming: Boolean(onToken), promptLength: attemptPrompt.length, temperature: config.temperature }
-      }, () => provider === 'openai' ? callOpenAI(attemptPrompt, config, { onToken, inputImages }) : JSON.stringify(fallbackResult));
+        input: attemptPrompt,
+        metadata: { attempt, streaming: Boolean(onToken), promptLength: attemptPrompt.length, temperature: config.temperature, maxOutputTokens: config.maxOutputTokens }
+      }, ({ recordUsage }) => provider === 'openai' ? callOpenAI(attemptPrompt, config, { onToken, inputImages, onUsage: recordUsage }) : JSON.stringify(fallbackResult));
       if (provider !== 'openai' && onToken) onToken(raw);
       return parseStructuredResponse(raw, validator);
     } catch (error) {
@@ -296,7 +297,7 @@ async function callStructuredAgent({ operation, prompt, fallbackResult, validato
   }
 }
 
-async function callOpenAI(prompt, config, { onToken, inputImages = [] } = {}) {
+async function callOpenAI(prompt, config, { onToken, inputImages = [], onUsage } = {}) {
   const input = inputImages.length
     ? [{
         role: 'user',
@@ -311,12 +312,13 @@ async function callOpenAI(prompt, config, { onToken, inputImages = [] } = {}) {
     const data = await response.json().catch(() => ({}));
     throw new Error(data.error?.message || 'OpenAI request failed');
   }
-  if (onToken) return readOpenAIStream(response, onToken);
+  if (onToken) return readOpenAIStream(response, onToken, onUsage);
   const data = await response.json();
+  onUsage?.(data.usage);
   return data.output_text || data.output?.flatMap((item) => item.content || []).map((part) => part.text).join('\n');
 }
 
-async function readOpenAIStream(response, onToken) {
+async function readOpenAIStream(response, onToken, onUsage) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -340,6 +342,7 @@ async function readOpenAIStream(response, onToken) {
           onToken(delta);
         }
         if (event.type === 'response.completed') {
+          onUsage?.(event.response?.usage);
           const finalText = event.response?.output_text || event.response?.output?.flatMap((item) => item.content || []).map((content) => content.text || '').join('\n');
           if (finalText && finalText.length > output.length) {
             const tail = finalText.slice(output.length);

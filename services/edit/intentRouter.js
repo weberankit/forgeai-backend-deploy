@@ -38,17 +38,22 @@ function rememberIntent(message, intent) {
 
 async function classifyWithSmallModel(message, config) {
   const { model } = config;
-  const response = await withCallLog({
+  const data = await withCallLog({
     type: 'ai_call', operation: 'intent_classification', provider: 'openai', model,
-    metadata: { messageLength: message.length }
-  }, () => fetchLlmResponse(config, {
+    input: buildIntentPrompt(message),
+    metadata: { messageLength: message.length, temperature: config.temperature, maxOutputTokens: config.maxOutputTokens }
+  }, async ({ recordUsage }) => {
+    const response = await fetchLlmResponse(config, {
       input: buildIntentPrompt(message)
-  }));
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    throw new Error(data.error?.message || 'Intent model request failed');
-  }
-  const data = await response.json();
+    });
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error?.message || 'Intent model request failed');
+    }
+    const responseData = await response.json();
+    recordUsage(responseData.usage);
+    return responseData;
+  });
   const raw = data.output_text || data.output?.flatMap((item) => item.content || []).map((part) => part.text || '').join('\n') || '';
   const parsed = JSON.parse(String(raw).trim().replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim());
   if (!allowedIntents.has(parsed.intent)) throw new Error('Intent model returned an unsupported intent');

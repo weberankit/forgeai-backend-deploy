@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { LLM_PROFILES } from '../config/llmProfiles.js';
+import { LLM_PROFILES, LLM_QUALITY_PROFILES } from '../config/llmProfiles.js';
+import { runWithRequestLlmContext } from '../context/requestLlmContext.js';
 import { getTaskLlmConfig } from '../config/taskLlmConfig.js';
 
 test('task LLM profiles remain authoritative over legacy environment model settings', () => {
@@ -19,4 +20,23 @@ test('task LLM profiles remain authoritative over legacy environment model setti
     for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
     Object.assign(process.env, previous);
   }
+});
+
+test('deep quality mode upgrades generation repair and edits without overspending on utility tasks', async () => {
+  const deep = await runWithRequestLlmContext({ openAiApiKey: 'sk-test-' + 'd'.repeat(32), qualityMode: 'deep' }, async () => ({
+    expansion: getTaskLlmConfig('expansion'),
+    planning: getTaskLlmConfig('planning'),
+    generation: getTaskLlmConfig('code_generation'),
+    repair: getTaskLlmConfig('generation_repair'),
+    edit: getTaskLlmConfig('edit'),
+    intent: getTaskLlmConfig('intent')
+  }));
+  assert.equal(deep.generation.model, 'gpt-5.2');
+  assert.equal(deep.repair.model, 'gpt-5.2');
+  assert.equal(deep.edit.model, 'gpt-5.2');
+  assert.equal(deep.edit.maxOutputTokens, 16000);
+  assert.equal(deep.expansion.model, LLM_QUALITY_PROFILES.standard.expansion.model);
+  assert.equal(deep.planning.model, LLM_QUALITY_PROFILES.standard.planning.model);
+  assert.equal(deep.intent.model, 'gpt-4.1-nano');
+  assert.equal(deep.generation.qualityMode, 'deep');
 });

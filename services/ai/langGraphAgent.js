@@ -277,7 +277,7 @@ async function callStructuredAgent({ operation, prompt, fallbackResult, validato
         type: 'ai_call', operation, provider,
         model: provider === 'openai' ? config.model : 'local-fallback',
         input: attemptPrompt,
-        metadata: { attempt, streaming: Boolean(onToken), promptLength: attemptPrompt.length, temperature: config.temperature, maxOutputTokens: config.maxOutputTokens }
+        metadata: { attempt, qualityMode: config.qualityMode, streaming: Boolean(onToken), promptLength: attemptPrompt.length, temperature: config.temperature, maxOutputTokens: config.maxOutputTokens }
       }, ({ recordUsage }) => provider === 'openai' ? callOpenAI(attemptPrompt, config, { onToken, inputImages, onUsage: recordUsage }) : JSON.stringify(fallbackResult));
       if (provider !== 'openai' && onToken) onToken(raw);
       return parseStructuredResponse(raw, validator);
@@ -376,6 +376,7 @@ function validateCodeGenerationResponse(value) {
 
 function validateEditResponse(value) {
   if (!value || !Array.isArray(value.changes)) return { valid: false, message: 'changes must be an array' };
+  if (value.changes.length === 0) return { valid: false, message: 'changes must contain at least one requested file update' };
   for (const change of value.changes) {
     if (!change.path || typeof change.path !== 'string') return { valid: false, message: 'change.path is required' };
     const operation = change.operation || change.changeType || 'update';

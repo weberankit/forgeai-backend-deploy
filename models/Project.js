@@ -95,6 +95,7 @@ const projectSchema = new mongoose.Schema(
     visitorId: { type: String, required: true, index: true },
     name: { type: String, required: true },
     originalPrompt: { type: String, required: true },
+    qualityMode: { type: String, enum: ['standard', 'deep'], default: 'standard' },
     imageMetadata: { type: mongoose.Schema.Types.Mixed, default: null },
     websiteReference: { type: mongoose.Schema.Types.Mixed, default: null },
     expandedSpec: { type: mongoose.Schema.Types.Mixed, default: null },

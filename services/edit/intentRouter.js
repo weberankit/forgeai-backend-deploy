@@ -2,7 +2,7 @@ import { withCallLog } from '../observability/centralCallLogger.js';
 import { getTaskLlmConfig } from '../../config/taskLlmConfig.js';
 import { fetchLlmResponse } from '../ai/llmTransport.js';
 import { isOpenAiCredentialError } from '../ai/openAiErrors.js';
-import { buildIntentPrompt } from '../ai/prompts/intentPrompt.js';
+import { buildEditTargetingPrompt, buildIntentPrompt } from '../ai/prompts/intentPrompt.js';
 
 const allowedIntents = new Set(['edit', 'explain', 'build', 'unknown']);
 const intentCache = new Map();
@@ -41,7 +41,7 @@ async function classifyWithSmallModel(message, config) {
   const data = await withCallLog({
     type: 'ai_call', operation: 'intent_classification', provider: 'openai', model,
     input: buildIntentPrompt(message),
-    metadata: { messageLength: message.length, temperature: config.temperature, maxOutputTokens: config.maxOutputTokens }
+    metadata: { qualityMode: config.qualityMode, messageLength: message.length, temperature: config.temperature, maxOutputTokens: config.maxOutputTokens }
   }, async ({ recordUsage }) => {
     const response = await fetchLlmResponse(config, {
       input: buildIntentPrompt(message)
@@ -68,4 +68,82 @@ function fallbackIntent(message) {
   if (contains(['build', 'create', 'generate', 'regenerate'])) return 'build';
   if (contains(['explain', 'why', 'how', 'what', 'where', 'which']) || text.endsWith('?')) return 'explain';
   return 'unknown';
+}
+
+export async function selectSemanticEditTargets(project, message, fallbackTargeting) {
+  const fallback = { ...fallbackTargeting, strategy: 'deterministic_fallback' };
+  const config = getTaskLlmConfig('intent');
+  if (config.provider !== 'openai' || !config.apiKey) return fallback;
+  const catalog = buildEditFileCatalog(project);
+  if (!catalog.length) return fallback;
+  for (let attempt = 1; attempt <= config.maxRetries; attempt += 1) {
+    try {
+      const selected = await selectTargetsWithSmallModel(message, catalog, config, attempt);
+      return finalizeSemanticTargets(project, selected, fallback);
+    } catch (error) {
+      if (isOpenAiCredentialError(error)) throw error;
+      console.warn('Semantic edit target selection failed', { attempt, message: error.message });
+    }
+  }
+  return fallback;
+}
+
+function buildEditFileCatalog(project) {
+  const graph = project.dependencyGraph || {};
+  const planned = new Map((project.blueprint?.fileList || []).map((file) => [file.path, file]));
+  const routes = project.blueprint?.routes || [];
+  return (project.generatedFiles || [])
+    .filter((file) => ['.js', '.jsx', '.css'].some((extension) => file.path.endsWith(extension)))
+    .slice(0, 80)
+    .map((file) => {
+      const node = graph[file.path] || {};
+      const basename = file.path.split('/').pop().replace('.jsx', '').replace('.js', '');
+      const route = routes.find((item) => String(item.component || '').toLowerCase() === basename.toLowerCase());
+      return {
+        path: file.path,
+        responsibility: String(planned.get(file.path)?.responsibility || '').slice(0, 180),
+        route: route?.path || undefined,
+        exports: (node.exports || []).slice(0, 12),
+        renders: (node.renders || []).slice(0, 12),
+        imports: (node.imports || []).slice(0, 12)
+      };
+    });
+}
+
+async function selectTargetsWithSmallModel(message, catalog, config, attempt) {
+  const prompt = buildEditTargetingPrompt(message, catalog);
+  const data = await withCallLog({
+    type: 'ai_call', operation: 'edit_targeting', provider: 'openai', model: config.model,
+    input: prompt,
+    metadata: { attempt, qualityMode: config.qualityMode, messageLength: String(message || '').length, catalogSize: catalog.length, maxOutputTokens: config.maxOutputTokens }
+  }, async ({ recordUsage }) => {
+    const response = await fetchLlmResponse(config, { input: prompt });
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error?.message || 'Edit target model request failed');
+    }
+    const responseData = await response.json();
+    recordUsage(responseData.usage);
+    return responseData;
+  });
+  const raw = data.output_text || data.output?.flatMap((item) => item.content || []).map((part) => part.text || '').join('\n') || '';
+  const parsed = JSON.parse(String(raw).trim().replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim());
+  const available = new Set(catalog.map((file) => file.path));
+  const targets = [...new Set((parsed.targets || []).filter((filePath) => available.has(filePath)))].slice(0, 6);
+  if (!targets.length) throw new Error('Edit target model did not select an available project file');
+  return { targets, understanding: String(parsed.understanding || '').slice(0, 500), confidence: ['high', 'medium', 'low'].includes(parsed.confidence) ? parsed.confidence : 'medium' };
+}
+
+function finalizeSemanticTargets(project, selected, fallback) {
+  const graph = project.dependencyGraph || {};
+  const available = new Set((project.generatedFiles || []).map((file) => file.path));
+  const targets = new Set(selected.targets);
+  for (const seed of selected.targets) {
+    for (const related of [...(graph[seed]?.imports || []), ...(graph[seed]?.importedBy || [])]) {
+      if (available.has(related) && ['.js', '.jsx', '.css'].some((extension) => related.endsWith(extension))) targets.add(related);
+      if (targets.size >= 8) break;
+    }
+    if (targets.size >= 8) break;
+  }
+  return { ...fallback, targets: [...targets].slice(0, 8), confidence: selected.confidence, understanding: selected.understanding, strategy: 'ai_semantic', needsClarification: false };
 }

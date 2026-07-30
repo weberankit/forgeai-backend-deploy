@@ -2,7 +2,8 @@
 // Environment variables can override any profile without changing source code.
 
 //cheap
-// export const LLM_PROFILES = Object.freeze({
+
+// const STANDARD_LLM_PROFILES = Object.freeze({
 //   expansion: profile('Turn a user request into a detailed specification', 'gpt-4.1-mini', 0.2, 8000),
 //   planning: profile('Create the project blueprint and file plan', 'gpt-4.1-mini', 0.15, 10000),
 //   code_generation: profile('Generate complete frontend source files', 'gpt-4.1-mini', 0.1, 16000),
@@ -14,73 +15,143 @@
 // });
 
 
-// // // Environment variables can override any profile without changing source code.
-export const LLM_PROFILES = Object.freeze({
-  expansion: profile(
-    'Turn a user request into a detailed specification',
-    'gpt-4.1-mini',
-    0.2,
-    8000
-  ),
+// // // // Environment variables can override any profile without changing source code.
+// export const LLM_PROFILES = Object.freeze({
+//   expansion: profile(
+//     'Turn a user request into a detailed specification',
+//     'gpt-4.1-mini',
+//     0.2,
+//     8000
+//   ),
 
-  planning: profile(
-    'Create the project blueprint and file plan',
-    'gpt-5.2',
-    undefined,
-    10000
-  ),
+//   planning: profile(
+//     'Create the project blueprint and file plan',
+//     'gpt-5.2',
+//     undefined,
+//     10000
+//   ),
 
-  code_generation: profile(
-    'Generate complete frontend source files',
-    'gpt-5.2',
-    undefined,
-    16000
-  ),
+//   code_generation: profile(
+//     'Generate complete frontend source files',
+//     'gpt-5.2',
+//     undefined,
+//     16000
+//   ),
 
-  generation_repair: profile(
-    'Repair invalid or incomplete generated files',
-    'gpt-5.2',
-    undefined,
-    16000
-  ),
+//   generation_repair: profile(
+//     'Repair invalid or incomplete generated files',
+//     'gpt-5.2',
+//     undefined,
+//     16000
+//   ),
 
-  edit: profile(
-    'Apply requested edits to generated files',
-    'gpt-5.2',
-    undefined,
-    16000
-  ),
+//   edit: profile(
+//     'Apply requested edits to generated files',
+//     'gpt-5.2',
+//     undefined,
+//     16000
+//   ),
 
-  explain: profile(
-    'Explain the generated application and code flow',
-    'gpt-4.1-mini',
-    0.3,
-    8000
-  ),
+//   explain: profile(
+//     'Explain the generated application and code flow',
+//     'gpt-4.1-mini',
+//     0.3,
+//     8000
+//   ),
 
-  vision: profile(
-    'Analyze an uploaded UI reference image',
-    'gpt-4.1-mini',
-    0.2,
-    4000
-  ),
+//   vision: profile(
+//     'Analyze an uploaded UI reference image',
+//     'gpt-4.1-mini',
+//     0.2,
+//     4000
+//   ),
 
-  intent: profile(
-    'Classify a chat message into edit/explain/build',
-    'gpt-4.1-mini',
-    0,
-    500
-  ),
+//   intent: profile(
+//     'Classify a chat message into edit/explain/build',
+//     'gpt-4.1-mini',
+//     0,
+//     500
+//   ),
+// });
+
+
+
+const STANDARD_LLM_PROFILES = Object.freeze({
+    expansion: profile(
+      'Turn a user request into a detailed specification',
+      'gpt-4.1-mini',
+      0.2,
+      8000
+    ),
+
+    planning: profile(
+      'Create the project blueprint and file plan',
+      'gpt-5.2',
+      undefined,
+      10000
+    ),
+
+    code_generation: profile(
+      'Generate complete frontend source files',
+      'gpt-5.4-mini',
+      undefined,
+      16000
+    ),
+
+    generation_repair: profile(
+      'Repair invalid or incomplete generated files',
+      'gpt-5.4-mini',
+      undefined,
+      16000
+    ),
+
+    edit: profile(
+      'Apply requested edits to generated files',
+      'gpt-5.4-mini',
+      undefined,
+      12000
+    ),
+
+    explain: profile(
+      'Explain the generated application and code flow',
+      'gpt-4.1-mini',
+      0.3,
+      6000
+    ),
+
+    vision: profile(
+      'Analyze an uploaded UI reference image',
+      'gpt-4.1-mini',
+      0.2,
+      4000
+    ),
+
+    intent: profile(
+      'Classify a chat message into edit/explain/build',
+      'gpt-4.1-nano',
+      0,
+      300
+    )
+  });
+
+const DEEP_LLM_PROFILES = Object.freeze({
+  ...STANDARD_LLM_PROFILES,
+  code_generation: profile('Generate complete frontend source files with maximum quality', 'gpt-5.2', undefined, 16000),
+  generation_repair: profile('Repair invalid or incomplete generated files with maximum quality', 'gpt-5.2', undefined, 16000),
+  edit: profile('Apply requested edits to generated files with maximum quality', 'gpt-5.2', undefined, 16000)
 });
 
+export const LLM_QUALITY_PROFILES = Object.freeze({
+  standard: STANDARD_LLM_PROFILES,
+  deep: DEEP_LLM_PROFILES
+});
 
+// Backward-compatible default used by existing imports and diagnostics.
+export const LLM_PROFILES = LLM_QUALITY_PROFILES.standard;
 
-
-
-
-
-
-
+export function getLlmProfile(task, qualityMode = 'standard') {
+  return LLM_QUALITY_PROFILES[qualityMode]?.[task];
+}
 
 function profile(description, model, temperature, maxOutputTokens, provider = 'openai') {
   return Object.freeze({

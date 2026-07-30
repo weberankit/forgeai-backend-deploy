@@ -152,23 +152,29 @@ export async function generateProjectFiles(project, options = {}) {
     project.dependencyGraph = runStaticValidation(project.generatedFiles || []).graph;
     let smokeRenderTest = runSmokeRenderTests(project.generatedFiles || []);
     if (!smokeRenderTest.passed) {
-      const fixResult = await runFixLoop(project, {
+      await runFixLoop(project, {
         runtimeOutput: 'Smoke/render test failed: ' + smokeRenderTest.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '),
         maxAttempts: 2
       });
-      if (fixResult.status !== 'passed') {
-        smokeRenderTest = runSmokeRenderTests(project.generatedFiles || []);
-        // Apply a tolerance threshold: if only a small number of non-critical files fail,
-        // emit warnings rather than aborting the entire pipeline.
+
+      // LLM repair output can regress manifest contracts (for example by
+      // replacing a page's default export with a named export). Re-apply the
+      // deterministic project contract before judging the final smoke result.
+      project.generatedFiles = repairProjectFiles(project.generatedFiles || [], manifest, warnings);
+      validateGeneratedFiles(project.generatedFiles || [], [], manifest);
+      project.dependencyGraph = runStaticValidation(project.generatedFiles || []).graph;
+      smokeRenderTest = runSmokeRenderTests(project.generatedFiles || []);
+
+      // Judge the repaired files themselves instead of the fix-loop status.
+      // A fix loop may escalate even though deterministic contract repair has
+      // produced a valid project.
+      if (!smokeRenderTest.passed) {
         if (!isSmokeTestBlockingFailure(smokeRenderTest)) {
           warnings.push('Smoke/render test has minor issues that were not fully repaired: ' + smokeRenderTest.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
         } else {
           throw new Error('Smoke/render test failed after fix attempts: ' + smokeRenderTest.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
         }
       }
-      project.generatedFiles = repairProjectFiles(project.generatedFiles || [], manifest, warnings);
-      validateGeneratedFiles(project.generatedFiles || [], [], manifest);
-      project.dependencyGraph = runStaticValidation(project.generatedFiles || []).graph;
     }
 
     project.generationStatus = 'storing';

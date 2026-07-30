@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { resolveEditTargets } from './editTargeting.js';
+import { selectSemanticEditTargets } from './intentRouter.js';
 import { createSnapshot } from '../review/versioningService.js';
 import { applyEditOperationsToFiles, validateEditOperations } from './editOperations.js';
 import { runStaticValidation } from '../review/staticValidation.js';
@@ -11,9 +12,10 @@ import { buildKnownPitfallsPrompt, retrieveVerifiedFixes } from '../memory/verif
 export async function applyNaturalLanguageEdit(project, message) {
   const refreshed = runStaticValidation(project.generatedFiles || []);
   project.dependencyGraph = refreshed.graph;
-  const targeting = resolveEditTargets(project, message);
+  const fallbackTargeting = resolveEditTargets(project, message);
+  const targeting = await selectSemanticEditTargets(project, message, fallbackTargeting);
   if (targeting.needsClarification) return saveClarification(project, 'Which file or section should I update?', targeting.targets);
-  const editResult = await produceEditChanges(project, message, targeting.targets);
+  const editResult = await produceEditChanges(project, message, targeting);
   if (!editResult.changes.length) {
     const detail = editResult.warnings.length ? ' ' + editResult.warnings.join(' ') : '';
     return saveClarification(project, 'Edit was not applied because no valid file changes were produced.' + detail, targeting.targets, editResult.warnings);
@@ -38,7 +40,8 @@ export async function applyNaturalLanguageEdit(project, message) {
   return { status: project.operationStatus, changes, targets: targeting.targets, warnings: editResult.warnings, validation };
 }
 
-async function produceEditChanges(project, message, targets) {
+async function produceEditChanges(project, message, targeting) {
+  const targets = targeting.targets;
   const targetFiles = (project.generatedFiles || [])
     .filter((file) => targets.includes(file.path))
     .map((file) => ({ path: file.path, language: file.language, content: file.content }));
@@ -52,7 +55,7 @@ async function produceEditChanges(project, message, targets) {
   });
   const dependencyContext = {
     targetGraph: Object.fromEntries(targets.map((target) => [target, graph[target] || {}])),
-    targetSelection: resolveEditTargets(project, message),
+    targetSelection: targeting,
     allowedCreateRoots: ['src/pages/', 'src/components/', 'src/layouts/', 'src/hooks/', 'src/utils/', 'src/data/'],
     knownPitfalls: buildKnownPitfallsPrompt(knownPitfalls)
   };

@@ -77,6 +77,28 @@ test('targets generated page files for hero visual edits', () => {
   assert.ok(result.targets.includes('src/pages/HomePage.jsx'));
 });
 
+test('typo-tolerant visual edit targets the home page and global styles', () => {
+  const files = [
+    { path: 'src/pages/Home.jsx', content: 'export default function Home(){ return <main>Home</main> }' },
+    { path: 'src/pages/Projects.jsx', content: 'export default function Projects(){ return <main>Projects</main> }' },
+    { path: 'src/pages/Skills.jsx', content: 'export default function Skills(){ return <main>Skills</main> }' },
+    { path: 'src/index.css', content: ':root { color: #111827; }' },
+    { path: 'src/styles/tokens.js', content: "export const colors = { primary: '#111827' };" },
+    { path: 'src/App.jsx', content: "import Home from './pages/Home.jsx'; export default function App(){ return <Home /> }" }
+  ];
+  const project = {
+    generatedFiles: files,
+    blueprint: { routes: [{ path: '/', component: 'Home' }] },
+    dependencyGraph: buildDependencyGraph(files)
+  };
+  const result = resolveEditTargets(project, 'see on homw page i wanted myimge andalso colour attrative colourfull');
+  assert.equal(result.confidence, 'high');
+  assert.ok(result.targets.includes('src/pages/Home.jsx'));
+  assert.ok(result.targets.includes('src/index.css'));
+  assert.ok(result.targets.includes('src/styles/tokens.js'));
+  assert.ok(!result.candidates.some((candidate) => candidate.reasons.includes('path:page')));
+});
+
 test('edit targeting uses AST component symbols and includes integration parents', () => {
   const files = [
     { path: 'src/App.jsx', content: "import CheckoutPanel from './components/CheckoutPanel.jsx'; export default function App(){ return <CheckoutPanel /> }" },

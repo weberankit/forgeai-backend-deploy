@@ -3,8 +3,15 @@ import { normalizeProjectPath } from './pathSafety.js';
 
 function expectedExportsFor(path, blueprint = {}) {
   const described = (blueprint.fileList || []).find((file) => normalizeSafe(file?.path) === path);
-  if (Array.isArray(described?.exports) && described.exports.length) return [...new Set(described.exports)];
-  if (/\.jsx$/.test(path) && (path.startsWith('src/pages/') || path.startsWith('src/components/') || path.startsWith('src/layouts/') || path === 'src/App.jsx')) return ['default'];
+  const describedExports = Array.isArray(described?.exports) ? described.exports : [];
+  const requiresDefault = /[.]jsx$/.test(path)
+    && (path.startsWith('src/pages/')
+      || path.startsWith('src/layouts/')
+      || path.startsWith('src/routes/')
+      || path === 'src/App.jsx');
+  if (requiresDefault) return [...new Set(['default', ...describedExports])];
+  if (describedExports.length) return [...new Set(describedExports)];
+  if (/[.]jsx$/.test(path) && path.startsWith('src/components/')) return ['default'];
   if (path === 'src/main.jsx' || /\.css$/.test(path) || !/\.(js|jsx)$/.test(path)) return [];
   return [];
 }

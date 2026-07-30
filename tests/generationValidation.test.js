@@ -203,6 +203,19 @@ test('manifest contract repairs and enforces a page default export before integr
   assert.doesNotThrow(() => validateGenerationBatch(repaired.files, ['src/pages/LandingPage.jsx'], [], manifest));
 });
 
+test('page manifest keeps default export when blueprint lists only a named export', () => {
+  const blueprint = {
+    fileList: [{ path: 'src/pages/Home.jsx', exports: ['Home'] }],
+    routes: [{ path: '/', component: 'Home' }]
+  };
+  const manifest = buildProjectManifest(blueprint, buildGenerationBatches(blueprint));
+  assert.deepEqual(manifest.files['src/pages/Home.jsx'].expectedExports, ['default', 'Home']);
+  const namedOnly = [{ path: 'src/pages/Home.jsx', content: 'export function Home(){ return <main />; }' }];
+  const repaired = runDeterministicRepairs([], namedOnly, manifest);
+  assert.match(repaired.files[0].content, /export default Home;/);
+  assert.equal(runSmokeRenderTests(repaired.files).passed, true);
+});
+
 test('prompt-aware fallback treats selling books as a bookstore landing page', async () => {
   const previousProvider = process.env.AI_PROVIDER;
   process.env.AI_PROVIDER = 'mock';

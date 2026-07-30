@@ -19,7 +19,7 @@ export async function describeImage(image) {
     const data = await withCallLog({
       type: 'ai_call', operation: 'image_description', provider: 'openai', model,
       input: { prompt: buildVisionPrompt(), image: { mimeType: image.mimetype, imageBytes: image.size } },
-      metadata: { mimeType: image.mimetype, imageBytes: image.size, temperature: config.temperature, maxOutputTokens: config.maxOutputTokens }
+      metadata: { qualityMode: config.qualityMode, mimeType: image.mimetype, imageBytes: image.size, temperature: config.temperature, maxOutputTokens: config.maxOutputTokens }
     }, async ({ recordUsage }) => {
       const response = await fetchLlmResponse(config, {
         input: [{

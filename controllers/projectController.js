@@ -17,6 +17,8 @@ import { explainProjectQuestion } from '../services/explain/explainAgent.js';
 import { startDeployment, getDeployment } from '../services/deploy/deploymentService.js';
 import { retrieveVerifiedFixes } from '../services/memory/verifiedFixMemory.js';
 import { getWebsiteCapture } from '../services/website/websiteCaptureStore.js';
+import { getRequestLlmQualityMode, setRequestLlmQualityMode } from '../context/requestLlmContext.js';
+import { normalizeLlmQualityMode } from '../config/llmQualityMode.js';
 import {
   buildExpansionWebsiteContext,
   buildGeneratorWebsiteReference
@@ -32,9 +34,21 @@ async function findVisitorChat(chatId, visitorId) {
   return chat;
 }
 
+function activeQualityMode(fallback = 'standard') {
+  return normalizeLlmQualityMode(getRequestLlmQualityMode(), fallback);
+}
+
+function syncProjectQualityMode(project) {
+  const qualityMode = activeQualityMode(project.qualityMode || 'standard');
+  setRequestLlmQualityMode(qualityMode);
+  project.qualityMode = qualityMode;
+  return qualityMode;
+}
+
 async function findVisitorProject(projectId, visitorId) {
   const project = await Project.findOne({ projectId, visitorId });
   if (!project) throw httpError(404, 'Project not found.');
+  syncProjectQualityMode(project);
   return project;
 }
 
@@ -83,6 +97,7 @@ export async function expandProjectStream(req, res, next) {
       visitorId: req.visitorId,
       name: expandedSpec.projectName,
       originalPrompt: prompt,
+      qualityMode: activeQualityMode(),
       imageMetadata: imageDescription?.metadata || null,
       websiteReference,
       expandedSpec,
@@ -126,6 +141,7 @@ export async function expandProject(req, res, next) {
       visitorId: req.visitorId,
       name: expandedSpec.projectName,
       originalPrompt: prompt,
+      qualityMode: activeQualityMode(),
       imageMetadata: imageDescription?.metadata || null,
       websiteReference,
       expandedSpec,

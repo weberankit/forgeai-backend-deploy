@@ -1,16 +1,19 @@
-import { LLM_PROFILES } from './llmProfiles.js';
-import { getRequestOpenAiApiKey } from '../context/requestLlmContext.js';
+import { LLM_PROFILES, getLlmProfile } from './llmProfiles.js';
+import { getRequestLlmQualityMode, getRequestOpenAiApiKey } from '../context/requestLlmContext.js';
+import { normalizeLlmQualityMode } from './llmQualityMode.js';
 import { httpError } from '../utils/httpError.js';
 import { OPENAI_API_KEY_REQUIRED } from '../services/ai/openAiErrors.js';
 
 export function getTaskLlmConfig(task) {
-  const profile = LLM_PROFILES[task];
+  const qualityMode = normalizeLlmQualityMode(getRequestLlmQualityMode(), 'standard');
+  const profile = getLlmProfile(task, qualityMode);
   if (!profile) throw new Error('Unknown LLM task: ' + task + '. Expected: ' + Object.keys(LLM_PROFILES).join(', '));
   const requestApiKey = getRequestOpenAiApiKey();
   const provider = requestApiKey ? 'openai' : 'mock';
 
   return {
     task,
+    qualityMode,
     description: profile.description,
     provider,
     apiKey: requestApiKey,

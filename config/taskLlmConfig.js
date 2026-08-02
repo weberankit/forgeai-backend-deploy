@@ -4,9 +4,9 @@ import { normalizeLlmQualityMode } from './llmQualityMode.js';
 import { httpError } from '../utils/httpError.js';
 import { OPENAI_API_KEY_REQUIRED } from '../services/ai/openAiErrors.js';
 
-export function getTaskLlmConfig(task) {
+export function getTaskLlmConfig(task, context = {}) {
   const qualityMode = normalizeLlmQualityMode(getRequestLlmQualityMode(), 'standard');
-  const profile = getLlmProfile(task, qualityMode);
+  const profile = getLlmProfile(task, qualityMode, context);
   if (!profile) throw new Error('Unknown LLM task: ' + task + '. Expected: ' + Object.keys(LLM_PROFILES).join(', '));
   const requestApiKey = getRequestOpenAiApiKey();
   const provider = requestApiKey ? 'openai' : 'mock';
@@ -14,6 +14,8 @@ export function getTaskLlmConfig(task) {
   return {
     task,
     qualityMode,
+    phase: context.phase,
+    agentName: context.agentName,
     description: profile.description,
     provider,
     apiKey: requestApiKey,
@@ -28,7 +30,7 @@ export function getTaskLlmConfig(task) {
 }
 
 export function listTaskLlmConfigs() {
-  return Object.keys(LLM_PROFILES).map(getTaskLlmConfig);
+  return Object.keys(LLM_PROFILES).map((task) => getTaskLlmConfig(task));
 }
 
 export function requireTaskLlmApiKey(config) {

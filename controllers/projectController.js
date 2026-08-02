@@ -8,7 +8,7 @@ import { generateProjectFiles, getGenerationPlan, upsertGeneratedFiles } from '.
 import { validateGeneratedFiles } from '../services/generation/generatedFileValidation.js';
 import { languageForPath, normalizeProjectPath } from '../services/generation/pathSafety.js';
 import { runQualityReview } from '../services/review/reviewAgent.js';
-import { runFixLoop } from '../services/review/fixAgent.js';
+import { assertRepairableProject, runFixLoop } from '../services/review/fixAgent.js';
 import { runStaticValidation } from '../services/review/staticValidation.js';
 import { applyNaturalLanguageEdit } from '../services/edit/editAgent.js';
 import { routeChatIntent } from '../services/edit/intentRouter.js';
@@ -23,6 +23,7 @@ import {
   buildExpansionWebsiteContext,
   buildGeneratorWebsiteReference
 } from '../services/website/websiteCaptureService.js';
+import { withProjectCallLog } from '../services/observability/centralCallLogger.js';
 
 function serializeProject(project) {
   return project.toObject({ versionKey: false });
@@ -86,18 +87,24 @@ export async function expandProjectStream(req, res, next) {
     if (prompt.length < 8) throw httpError(400, 'Prompt must be at least 8 characters.');
 
     const chat = await findVisitorChat(chatId, req.visitorId);
+    const projectId = randomUUID();
+    const qualityMode = activeQualityMode();
     const imageDescription = await describeImage(req.file);
     const { websiteContext, websiteReference } = websiteCaptureForRequest(req, prompt);
-    const expandedSpec = await expandSpecification({ prompt, imageDescription, websiteContext, onToken: (token) => writeSse(res, 'token', { token }) });
+    const expandedSpec = await withProjectCallLog({
+      projectId,
+      operation: 'project_expansion',
+      qualityMode
+    }, () => expandSpecification({ prompt, imageDescription, websiteContext, onToken: (token) => writeSse(res, 'token', { token }) }));
     if (websiteReference) expandedSpec.websiteReference = websiteReference;
 
     const project = await Project.create({
-      projectId: randomUUID(),
+      projectId,
       chatId,
       visitorId: req.visitorId,
       name: expandedSpec.projectName,
       originalPrompt: prompt,
-      qualityMode: activeQualityMode(),
+      qualityMode,
       imageMetadata: imageDescription?.metadata || null,
       websiteReference,
       expandedSpec,
@@ -130,18 +137,24 @@ export async function expandProject(req, res, next) {
     if (prompt.length < 8) throw httpError(400, 'Prompt must be at least 8 characters.');
 
     const chat = await findVisitorChat(chatId, req.visitorId);
+    const projectId = randomUUID();
+    const qualityMode = activeQualityMode();
     const imageDescription = await describeImage(req.file);
     const { websiteContext, websiteReference } = websiteCaptureForRequest(req, prompt);
-    const expandedSpec = await expandSpecification({ prompt, imageDescription, websiteContext });
+    const expandedSpec = await withProjectCallLog({
+      projectId,
+      operation: 'project_expansion',
+      qualityMode
+    }, () => expandSpecification({ prompt, imageDescription, websiteContext }));
     if (websiteReference) expandedSpec.websiteReference = websiteReference;
 
     const project = await Project.create({
-      projectId: randomUUID(),
+      projectId,
       chatId,
       visitorId: req.visitorId,
       name: expandedSpec.projectName,
       originalPrompt: prompt,
-      qualityMode: activeQualityMode(),
+      qualityMode,
       imageMetadata: imageDescription?.metadata || null,
       websiteReference,
       expandedSpec,
@@ -175,11 +188,15 @@ export async function planProjectStream(req, res, next) {
     const specification = req.body.specification || project.expandedSpec;
     if (!specification) throw httpError(400, 'Specification is required.');
 
-    const blueprint = await planFrontendProject({
+    const blueprint = await withProjectCallLog({
+      projectId: project.projectId,
+      operation: 'project_planning',
+      qualityMode: project.qualityMode
+    }, () => planFrontendProject({
       specification,
       clarification: req.body.clarification,
       onToken: (token) => writeSse(res, 'token', { token })
-    });
+    }));
 
     project.expandedSpec = specification;
     project.blueprint = blueprint;
@@ -214,10 +231,14 @@ export async function planProject(req, res, next) {
     const specification = req.body.specification || project.expandedSpec;
     if (!specification) throw httpError(400, 'Specification is required.');
 
-    const blueprint = await planFrontendProject({
+    const blueprint = await withProjectCallLog({
+      projectId: project.projectId,
+      operation: 'project_planning',
+      qualityMode: project.qualityMode
+    }, () => planFrontendProject({
       specification,
       clarification: req.body.clarification
-    });
+    }));
 
     project.expandedSpec = specification;
     project.blueprint = blueprint;
@@ -389,6 +410,7 @@ export async function reviewProject(req, res, next) {
 export async function fixProject(req, res, next) {
   try {
     const project = await findVisitorProject(req.params.projectId, req.visitorId);
+    assertRepairableProject(project);
     project.operationStatus = 'fixing';
     await project.save();
     const result = await runFixLoop(project, {

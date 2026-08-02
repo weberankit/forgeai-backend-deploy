@@ -41,11 +41,23 @@ export async function listChats(req, res, next) {
   }
 }
 
+export function latestChatProjectId(messages = []) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const projectId = String(messages[index]?.metadata?.projectId || '').trim();
+    if (projectId) return projectId;
+  }
+  return '';
+}
+
 export async function getChat(req, res, next) {
   try {
     const chat = await Chat.findOne({ chatId: req.params.chatId, visitorId: req.visitorId });
     if (!chat) throw httpError(404, 'Chat not found.');
-    const project = await Project.findOne({ chatId: req.params.chatId, visitorId: req.visitorId }).sort({ updatedAt: -1 }).lean();
+    const recordedProjectId = latestChatProjectId(chat.messages || []);
+    let project = recordedProjectId
+      ? await Project.findOne({ projectId: recordedProjectId, chatId: req.params.chatId, visitorId: req.visitorId }).lean()
+      : null;
+    if (!project) project = await Project.findOne({ chatId: req.params.chatId, visitorId: req.visitorId }).sort({ updatedAt: -1 }).lean();
     res.json({ chat: serializeChat(chat), project });
   } catch (error) {
     next(error);

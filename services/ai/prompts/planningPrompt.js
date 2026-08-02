@@ -24,6 +24,11 @@ Rules:
 - Never plan reuse, download, or hotlinking of source website image/media/logo URLs. For captured asset roles, plan stable mock or locally generated replacements that preserve placement, dimensions, aspect ratio, and purpose.
 - For websiteReference.mode "clone", plan every selected route and preserve the captured hierarchy, visual tokens, responsive structure, and interactions. For "reference", plan a distinct app that applies the captured design language without copying it one-to-one.
 
+Behavior example (shape guidance only; the supplied specification remains authoritative):
+- For a bookstore React app, plan mock book data and reusable BookCard/filter/cart contracts before CatalogPage and CartPage; then plan App.jsx as the only route integrator and main.jsx as the only mount point.
+- A BookCard import must point to its exact planned file, name the exact exported symbol, and appear in dependsOn. CatalogPage owns the catalog workflow; it must not be silently replaced by a generic dashboard.
+- If checkout is requested without a backend, plan a complete local mock checkout interaction and state the frontend-only limitation in acceptanceCriteria; never plan an API server or real payment secret.
+
 Specification:
 ${JSON.stringify(specification, null, 2)}
 

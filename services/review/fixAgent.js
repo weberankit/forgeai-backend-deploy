@@ -8,11 +8,44 @@ import { isOpenAiCredentialError } from '../ai/openAiErrors.js';
 import { repairMissingRelativeImports } from '../generation/importRepair.js';
 import { languageForPath, normalizeProjectPath } from '../generation/pathSafety.js';
 import path from 'path';
+import { withProjectCallLog } from '../observability/centralCallLogger.js';
+import { httpError } from '../../utils/httpError.js';
 
-export async function runFixLoop(project, { runtimeOutput = '', runtimeEvidence = {}, maxAttempts = 2 } = {}) {
+export function assertRepairableProject(project) {
+  if (!project?.generatedFiles?.length) {
+    throw httpError(409, 'Project has no persisted generated files to repair. Generate the project again before running preview repair.');
+  }
+}
+
+export async function runFixLoop(project, options = {}) {
+  assertRepairableProject(project);
+  const runtimeOutput = String(options.runtimeOutput || '');
+  const runtimeEvidence = options.runtimeEvidence || {};
+  const maxAttempts = options.maxAttempts || 2;
+  return withProjectCallLog({
+    projectId: project.projectId,
+    operation: 'project_repair',
+    qualityMode: project.qualityMode,
+    metadata: { maxAttempts, hasRuntimeEvidence: Boolean(runtimeOutput.trim() || runtimeEvidence?.errorType) }
+  }, async (telemetry) => {
+    if (runtimeOutput.trim() || runtimeEvidence?.errorType) {
+      telemetry.recordEvent('preview_error_detected', { errorType: runtimeEvidence?.errorType || 'runtime_error' }, 'ERROR');
+    }
+    const result = await runFixLoopInternal(project, { runtimeOutput, runtimeEvidence, maxAttempts }, telemetry);
+    const failed = ['no_progress', 'escalated'].includes(result.status);
+    telemetry.recordEvent('repair_' + result.status, { attemptCount: result.attempts?.length || 0 }, failed ? 'ERROR' : 'DEFAULT');
+    telemetry.recordOutcome(result.status, { attemptCount: result.attempts?.length || 0 }, failed ? 'ERROR' : 'DEFAULT');
+    return result;
+  });
+}
+
+async function runFixLoopInternal(project, { runtimeOutput = '', runtimeEvidence = {}, maxAttempts = 2 } = {}, telemetry) {
   const runs = [];
+  const appliedChanges = [];
+  const requiresPreviewVerification = Boolean(String(runtimeOutput || '').trim() || runtimeEvidence?.errorType);
   let pendingVerifiedFix = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    telemetry.recordEvent('repair_attempt_started', { attempt });
     const review = await runQualityReview({ project, runtimeOutput, runtimeEvidence, attempt });
     runs.push(review);
     project.reviewHistory.push(review);
@@ -30,31 +63,49 @@ export async function runFixLoop(project, { runtimeOutput = '', runtimeEvidence 
         pendingVerifiedFix = null;
       }
       await project.save();
-      return { status: 'passed', review, attempts: runs };
+      return { status: 'passed', review, attempts: runs, appliedChanges };
     }
     const fixResult = await produceFixes(project, review, attempt);
-    if (!fixResult.changes.length) {
+    const meaningfulChanges = filterMeaningfulChanges(project.generatedFiles || [], fixResult.changes || []);
+    if (!meaningfulChanges.length) {
+      telemetry.recordEvent('repair_no_progress', { attempt }, 'ERROR');
+      runtimeOutput = [runtimeOutput, 'Previous repair attempt made no meaningful file changes. Diagnose a different root cause and do not return identical content.'].filter(Boolean).join('\n');
+      if (attempt < maxAttempts) continue;
       review.status = 'escalated';
       project.operationStatus = 'human_escalation';
       await project.save();
-      return { status: 'escalated', review, attempts: runs, fixResult };
+      return { status: 'no_progress', reason: 'Repair attempts returned no meaningful file changes.', review, attempts: runs, fixResult, appliedChanges };
     }
-    const proposedFiles = applyChangesInMemory(project.generatedFiles || [], fixResult.changes);
+    fixResult.changes = meaningfulChanges;
+    const proposedFiles = applyChangesInMemory(project.generatedFiles || [], meaningfulChanges);
     const validation = runStaticValidation(proposedFiles);
     review.fixChanges = fixResult.changes.map((change) => ({ path: change.path, reason: change.reason }));
     if (!validation.passed) {
+      telemetry.recordEvent('repair_validation_failed', { attempt, errorCount: validation.errors.length }, 'ERROR');
       project.operationStatus = 'fix_validation_failed';
       runtimeOutput = validation.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; ');
       continue;
     }
     createSnapshot(project, 'fix', 'Attempt ' + attempt + ' for findings ' + fixResult.resolvedFindingIds.join(', '));
-    applyFileChanges(project, fixResult.changes, 'fix', randomUUID());
+    applyFileChanges(project, meaningfulChanges, 'fix', randomUUID());
+    appliedChanges.push(...meaningfulChanges.map((change) => change.path));
     project.dependencyGraph = validation.graph;
     project.operationStatus = 'fix_applied';
-    addVerifiedFix(project, fixResult, review);
+    telemetry.recordEvent('repair_changes_applied', { attempt, changedFileCount: meaningfulChanges.length });
+    if (!requiresPreviewVerification) addVerifiedFix(project, fixResult, review);
     pendingVerifiedFix = { review, changes: fixResult.changes, attempt };
     runtimeOutput = '';
     await project.save();
+    if (requiresPreviewVerification) {
+      return {
+        status: 'verification_required',
+        reason: 'Static validation passed; the browser preview must now confirm the runtime repair.',
+        review,
+        attempts: runs,
+        fixResult,
+        appliedChanges: [...new Set(appliedChanges)]
+      };
+    }
   }
   const finalReview = await runQualityReview({ project, runtimeOutput: '', runtimeEvidence, attempt: maxAttempts + 1 });
   runs.push(finalReview);
@@ -64,11 +115,11 @@ export async function runFixLoop(project, { runtimeOutput = '', runtimeEvidence 
     project.dependencyGraph = finalReview.staticValidation.graph;
     if (pendingVerifiedFix) await storeVerifiedFixCandidate({ project, review: pendingVerifiedFix.review, fixChanges: pendingVerifiedFix.changes, validationPassed: true, previewEvidence: ['final review passed after fix attempt ' + pendingVerifiedFix.attempt] }).catch(() => null);
     await project.save();
-    return { status: 'passed', review: finalReview, attempts: runs };
+    return { status: 'passed', review: finalReview, attempts: runs, appliedChanges: [...new Set(appliedChanges)] };
   }
   project.operationStatus = 'human_escalation';
   await project.save();
-  return { status: 'escalated', attempts: runs };
+  return { status: 'escalated', attempts: runs, appliedChanges: [...new Set(appliedChanges)] };
 }
 
 export async function produceFixes(project, review, attempt = 1) {
@@ -126,6 +177,7 @@ async function produceDynamicLlmFixes(project, review, attempt) {
     fallback: { files: repairMissingRelativeImports(files).filter((file) => targets.includes(normalizeProjectPath(file.path))), contracts: [], warnings: [] },
     agentName: 'Dynamic Preview Repair Agent',
     phase: 'runtime_and_import_repair',
+    batchNumber: null,
     dependencyContext: { runtimeEvidence: review.runtimeEvidence || {}, findings: blocking, dependencyGraph: validation.graph, instruction: 'Use the runtime stack, source, route, symbols, and related graph files to identify the root cause. Create missing modules and correct imports/exports. Never delete a required feature import merely to pass validation.' },
     attempt
   });
@@ -206,6 +258,14 @@ function applyChangesInMemory(files, changes) {
     map.set(filePath, { ...(map.get(filePath) || {}), path: filePath, language: change.language || languageForPath(filePath), content: String(change.content || '') });
   }
   return [...map.values()];
+}
+
+function filterMeaningfulChanges(files, changes) {
+  const current = new Map((files || []).map((file) => [normalizeProjectPath(file.path), String(file.content || '')]));
+  return (changes || []).filter((change) => {
+    const filePath = normalizeProjectPath(change.path);
+    return !current.has(filePath) || current.get(filePath) !== String(change.content || '');
+  });
 }
 
 function safeModuleContent(filePath) {

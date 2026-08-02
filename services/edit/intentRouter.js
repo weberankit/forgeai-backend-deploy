@@ -5,6 +5,8 @@ import { isOpenAiCredentialError } from '../ai/openAiErrors.js';
 import { buildEditTargetingPrompt, buildIntentPrompt } from '../ai/prompts/intentPrompt.js';
 
 const allowedIntents = new Set(['edit', 'explain', 'build', 'unknown']);
+const allowedEditScopes = new Set(['focused', 'multi_file', 'whole_project', 'missing_target']);
+const allowedClarity = new Set(['clear', 'ambiguous']);
 const intentCache = new Map();
 const INTENT_CACHE_MS = 30_000;
 
@@ -130,11 +132,36 @@ async function selectTargetsWithSmallModel(message, catalog, config, attempt) {
   const parsed = JSON.parse(String(raw).trim().replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim());
   const available = new Set(catalog.map((file) => file.path));
   const targets = [...new Set((parsed.targets || []).filter((filePath) => available.has(filePath)))].slice(0, 6);
-  if (!targets.length) throw new Error('Edit target model did not select an available project file');
-  return { targets, understanding: String(parsed.understanding || '').slice(0, 500), confidence: ['high', 'medium', 'low'].includes(parsed.confidence) ? parsed.confidence : 'medium' };
+  const scope = allowedEditScopes.has(parsed.scope) ? parsed.scope : 'focused';
+  const clarity = allowedClarity.has(parsed.clarity) ? parsed.clarity : 'clear';
+  const needsClarification = parsed.needsClarification === true || clarity === 'ambiguous' || scope === 'missing_target';
+  const clarificationQuestion = String(parsed.clarificationQuestion || '').trim().slice(0, 500);
+  if (needsClarification && !clarificationQuestion) throw new Error('Edit target model did not provide a clarification question');
+  if (!needsClarification && !targets.length) throw new Error('Edit target model did not select an available project file');
+  return {
+    targets,
+    understanding: String(parsed.understanding || '').slice(0, 500),
+    confidence: ['high', 'medium', 'low'].includes(parsed.confidence) ? parsed.confidence : 'medium',
+    scope,
+    clarity,
+    needsClarification,
+    clarificationReason: String(parsed.clarificationReason || '').trim().slice(0, 120),
+    clarificationQuestion,
+    requestedTargets: Array.isArray(parsed.requestedTargets)
+      ? parsed.requestedTargets.map((target) => String(target).trim()).filter(Boolean).slice(0, 8)
+      : []
+  };
 }
 
 function finalizeSemanticTargets(project, selected, fallback) {
+  if (selected.needsClarification) {
+    return {
+      ...fallback,
+      ...selected,
+      targets: selected.targets,
+      strategy: 'ai_semantic'
+    };
+  }
   const graph = project.dependencyGraph || {};
   const available = new Set((project.generatedFiles || []).map((file) => file.path));
   const targets = new Set(selected.targets);
@@ -145,5 +172,11 @@ function finalizeSemanticTargets(project, selected, fallback) {
     }
     if (targets.size >= 8) break;
   }
-  return { ...fallback, targets: [...targets].slice(0, 8), confidence: selected.confidence, understanding: selected.understanding, strategy: 'ai_semantic', needsClarification: false };
+  return {
+    ...fallback,
+    ...selected,
+    targets: [...targets].slice(0, 8),
+    strategy: 'ai_semantic',
+    needsClarification: false
+  };
 }

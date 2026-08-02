@@ -12,6 +12,7 @@ import { buildCodeGenerationPrompt } from '../services/ai/prompts/codeGeneration
 import { buildExpansionPrompt } from '../services/ai/prompts/expansionPrompt.js';
 import { buildPlanningPrompt } from '../services/ai/prompts/planningPrompt.js';
 import { validateBlueprint, validateExpansionSpec } from '../services/ai/parseStructuredResponse.js';
+import { sanitizePackageJson } from '../services/generation/packageSafety.js';
 
 test('code generation prompt preserves the standard implementation workflow', () => {
   const prompt = buildCodeGenerationPrompt({
@@ -41,6 +42,22 @@ test('planning prompt keeps npm packages outside the internal file dependency gr
   assert.match(prompt, /imports and dependsOn must contain only exact internal generated-file paths/);
   assert.match(prompt, /Never put react, react-dom, react-router-dom, lucide-react/);
   assert.match(prompt, /List npm packages only in requiredDependencies/);
+});
+
+test('managed frontend dependencies use authoritative compatible versions', () => {
+  const sanitized = JSON.parse(sanitizePackageJson(JSON.stringify({
+    dependencies: { react: '^18.2.0', 'lucide-react': '^0.268.0', 'react-router-dom': '^6.14.1' },
+    devDependencies: { vite: '^4.3.9', '@vitejs/plugin-react': '^4.0.0' }
+  })));
+  assert.equal(sanitized.dependencies['lucide-react'], '^0.468.0');
+  assert.equal(sanitized.dependencies.react, '^18.3.1');
+  assert.equal(sanitized.dependencies['react-router-dom'], '^6.26.1');
+  assert.equal(sanitized.devDependencies.vite, '^5.4.2');
+  assert.equal(sanitized.devDependencies['@vitejs/plugin-react'], '^4.3.1');
+
+  const repaired = runDeterministicRepairs([], [{ path: 'package.json', content: JSON.stringify({ dependencies: { 'lucide-react': '^0.268.0' } }) }]);
+  assert.equal(JSON.parse(repaired.files[0].content).dependencies['lucide-react'], '^0.468.0');
+  assert.ok(repaired.repairs.some((repair) => repair.code === 'MANAGED_DEPENDENCY_VERSION'));
 });
 
 test('deterministically removes duplicate declarations and redundant named exports', () => {

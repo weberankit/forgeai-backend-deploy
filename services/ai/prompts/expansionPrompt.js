@@ -28,6 +28,11 @@ Rules:
 - When website mode is "clone", preserve the selected pages' route set, information hierarchy, section order, layout, typography scale, colors, spacing, responsive behavior, and interaction patterns in an original React implementation.
 - When website mode is "reference", use its visual language and UX patterns as inspiration without producing a one-to-one copy.
 
+Behavior example (shape guidance only; never copy its product details into unrelated requests):
+- If the user says "create a bookstore React app", identify the actual experience: catalog browsing, search/filtering, book details, cart interactions, responsive navigation, mock book data, and a coherent editorial visual direction.
+- Ask only useful missing product questions such as whether checkout is required or which audience/design style is preferred. After Clarification is supplied, encode the answers as concrete pages, routes, features, data, and acceptance-ready requirements instead of asking again.
+- Do not reduce the request to "build a React app", choose implementation architecture, or invent a backend.
+
 User prompt:
 ${prompt}
 

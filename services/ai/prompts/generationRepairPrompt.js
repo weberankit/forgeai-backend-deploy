@@ -1,3 +1,5 @@
+import { formatGenerationAgentPlaybook } from "./generationAgentPlaybooks.js";
+
 export function buildGenerationRepairPrompt({ specification, blueprint, previousFiles, targetFiles, generatedFiles, validationError, contracts, warnings, agentName, phase, dependencyContext, attempt }) {
   return [
     'You are the Generation Repair Agent for a frontend-only React Vite project.',
@@ -12,6 +14,9 @@ export function buildGenerationRepairPrompt({ specification, blueprint, previous
     'Repair attempt: ' + (attempt || 1),
     'Failed agent: ' + (agentName || 'Code Generation Agent'),
     'Phase: ' + (phase || 'code_generation'),
+    '',
+    "Preserve the failed agent's ownership and behavioral contract while repairing:",
+    formatGenerationAgentPlaybook(agentName),
     '',
     'Hard requirements:',
     '- Return this exact JSON shape: { "files": [{ "path": "src/index.css", "language": "css", "content": "complete file content" }], "contracts": [], "warnings": [] }',

@@ -10,27 +10,49 @@ import { isOpenAiCredentialError } from '../ai/openAiErrors.js';
 import { buildKnownPitfallsPrompt, retrieveVerifiedFixes } from '../memory/verifiedFixMemory.js';
 
 export async function applyNaturalLanguageEdit(project, message) {
+  const request = buildEditRequest(project.pendingEditClarification, message);
   const refreshed = runStaticValidation(project.generatedFiles || []);
   project.dependencyGraph = refreshed.graph;
-  const fallbackTargeting = resolveEditTargets(project, message);
-  const targeting = await selectSemanticEditTargets(project, message, fallbackTargeting);
-  if (targeting.needsClarification) return saveClarification(project, 'Which file or section should I update?', targeting.targets);
-  const editResult = await produceEditChanges(project, message, targeting);
+  const fallbackTargeting = resolveEditTargets(project, request.effectiveMessage);
+  const targeting = await selectSemanticEditTargets(project, request.effectiveMessage, fallbackTargeting);
+  if (targeting.needsClarification) {
+    return saveClarification(project, {
+      question: targeting.clarificationQuestion || defaultClarificationQuestion(targeting),
+      originalRequest: request.originalRequest,
+      latestAnswer: request.latestAnswer,
+      reason: targeting.clarificationReason || targeting.scope || 'request_unclear',
+      targets: targeting.targets
+    });
+  }
+  const editResult = await produceEditChanges(project, request.effectiveMessage, targeting);
   if (!editResult.changes.length) {
-    const detail = editResult.warnings.length ? ' ' + editResult.warnings.join(' ') : '';
-    return saveClarification(project, 'Edit was not applied because no valid file changes were produced.' + detail, targeting.targets, editResult.warnings);
+    return saveClarification(project, {
+      question: failedEditClarification(targeting),
+      originalRequest: request.originalRequest,
+      latestAnswer: request.latestAnswer,
+      reason: 'edit_generation_failed',
+      targets: targeting.targets
+    });
   }
   let changes;
   try {
-    changes = validateEditOperations(project.generatedFiles || [], editResult.changes, targeting.targets, message);
+    changes = validateEditOperations(project.generatedFiles || [], editResult.changes, targeting.targets, request.effectiveMessage);
   } catch (error) {
-    return saveClarification(project, 'Edit was not applied: ' + error.message, targeting.targets, [error.message]);
+    console.warn('Edit operations could not be applied safely', { message: error.message });
+    return saveClarification(project, {
+      question: failedEditClarification(targeting),
+      originalRequest: request.originalRequest,
+      latestAnswer: request.latestAnswer,
+      reason: 'edit_validation_failed',
+      targets: targeting.targets
+    });
   }
-  createSnapshot(project, 'edit', message);
+  createSnapshot(project, 'edit', request.effectiveMessage);
   const operationId = randomUUID();
   project.generatedFiles = applyEditOperationsToFiles(project.generatedFiles || [], changes, operationId);
   project.lastChangedFiles = changes.map((change) => change.path);
-  project.lastEditMessage = message;
+  project.lastEditMessage = request.effectiveMessage;
+  project.pendingEditClarification = null;
   project.operationStatus = 'validating';
   const validation = runStaticValidation(project.generatedFiles || []);
   project.dependencyGraph = validation.graph;
@@ -111,8 +133,43 @@ function addProgressBar(content) {
 }
 function addLocalStorageHint(content) { if (content.includes('localStorage')) return content; return String(content).replace('export default function', "const storageKey = 'generated-app-state';\nfunction saveState(value) { localStorage.setItem(storageKey, JSON.stringify(value)); }\n\nexport default function"); }
 
-async function saveClarification(project, clarification, targets = [], warnings = []) {
+function buildEditRequest(pending, latestMessage) {
+  const answer = String(latestMessage || '').trim();
+  const originalRequest = String(pending?.originalRequest || answer).trim();
+  if (!pending?.originalRequest) return { originalRequest, latestAnswer: '', effectiveMessage: answer };
+  return {
+    originalRequest,
+    latestAnswer: answer,
+    effectiveMessage: [
+      'Original edit request: ' + originalRequest,
+      pending.question ? 'Previous clarification question: ' + String(pending.question) : '',
+      'User clarification answer: ' + answer
+    ].filter(Boolean).join('\n')
+  };
+}
+
+function defaultClarificationQuestion(targeting) {
+  if (targeting.scope === 'missing_target') return 'That page or component does not exist in this project. Should I create it, or would you like to change an existing page instead?';
+  return 'Please tell me which page or component to change and what result you want, such as its styling, layout, content, or mobile behavior.';
+}
+
+function failedEditClarification(targeting) {
+  const selected = (targeting.targets || []).slice(0, 3).join(', ');
+  return selected
+    ? 'I could not safely apply that edit. Please narrow the request by telling me what should change in ' + selected + ', such as the layout, styling, content, or mobile behavior.'
+    : 'I could not safely apply that edit. Please tell me which page or component to change and describe the specific result you want.';
+}
+
+async function saveClarification(project, { question, originalRequest, latestAnswer = '', reason, targets = [] }) {
   project.operationStatus = 'needs_clarification';
+  project.pendingEditClarification = {
+    originalRequest,
+    latestAnswer,
+    question,
+    reason,
+    targets,
+    createdAt: new Date().toISOString()
+  };
   await project.save();
-  return { status: 'needs_clarification', clarification, targets, warnings };
+  return { status: 'needs_clarification', clarification: question, reason, targets, warnings: [] };
 }

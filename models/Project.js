@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { normalizeGenerationWarnings } from '../utils/generationWarnings.js';
 
 const generatedFileSchema = new mongoose.Schema(
   {
@@ -120,7 +121,7 @@ const projectSchema = new mongoose.Schema(
     },
     currentBatch: { type: Number, default: 0 },
     generationProgress: { type: Number, default: 0 },
-    generationWarnings: { type: [String], default: [] },
+    generationWarnings: { type: [String], default: [], set: normalizeGenerationWarnings },
     failedBatch: { type: Number, default: null },
     generationError: { type: String, default: '' },
     lastSuccessfulPreviewAt: { type: Date, default: null },
@@ -130,6 +131,7 @@ const projectSchema = new mongoose.Schema(
       default: 'draft'
     },
     clarification: { type: String, default: '' },
+    pendingEditClarification: { type: mongoose.Schema.Types.Mixed, default: null },
     status: { type: String, enum: ['spec_ready', 'planned', 'approved', 'changes_requested'], default: 'spec_ready' }
   },
   { timestamps: true }

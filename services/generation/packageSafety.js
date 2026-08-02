@@ -1,9 +1,20 @@
 import { httpError } from '../../utils/httpError.js';
 
-export const baseDependencies = new Set([
-  '@vitejs/plugin-react', 'vite', 'react', 'react-dom', 'react-router-dom',
-  '@reduxjs/toolkit', 'react-redux', 'tailwindcss', 'postcss', 'autoprefixer', 'lucide-react'
-]);
+export const managedDependencyVersions = Object.freeze({
+  '@vitejs/plugin-react': '^4.3.1',
+  vite: '^5.4.2',
+  react: '^18.3.1',
+  'react-dom': '^18.3.1',
+  'react-router-dom': '^6.26.1',
+  'lucide-react': '^0.468.0',
+  tailwindcss: '^3.4.10',
+  postcss: '^8.4.41',
+  autoprefixer: '^10.4.20',
+  '@reduxjs/toolkit': '^2.2.7',
+  'react-redux': '^9.1.2'
+});
+
+export const baseDependencies = new Set(Object.keys(managedDependencyVersions));
 
 const blockedPackages = new Set([
   'express', 'fastify', 'koa', 'hapi', '@hapi/hapi', 'next', 'nuxt',
@@ -42,7 +53,12 @@ export function sanitizePackageJson(content) {
   for (const field of ['dependencies', 'devDependencies']) {
     if (!parsed[field] || typeof parsed[field] !== 'object') continue;
     for (const [name, version] of Object.entries(parsed[field])) {
-      if (!isSafeFrontendDependency(name, version)) { removed.push(name); delete parsed[field][name]; }
+      if (!isSafeFrontendDependency(name, version)) {
+        removed.push(name);
+        delete parsed[field][name];
+        continue;
+      }
+      if (managedDependencyVersions[name]) parsed[field][name] = managedDependencyVersions[name];
     }
     if (Object.keys(parsed[field]).length === 0) delete parsed[field];
   }

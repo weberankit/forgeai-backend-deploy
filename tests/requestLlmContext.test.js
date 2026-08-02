@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { LLM_QUALITY_PROFILES } from '../config/llmProfiles.js';
 import {
   getRequestLlmQualityMode,
   getRequestOpenAiApiKey,
@@ -46,8 +47,8 @@ test('quality modes stay isolated across concurrent request contexts', async () 
     runWithRequestLlmContext({ openAiApiKey: firstKey, qualityMode: 'standard' }, async () => { await new Promise((resolve) => setTimeout(resolve, 10)); return { mode: getRequestLlmQualityMode(), model: getTaskLlmConfig('edit').model }; }),
     runWithRequestLlmContext({ openAiApiKey: secondKey, qualityMode: 'deep' }, async () => { await new Promise((resolve) => setTimeout(resolve, 2)); return { mode: getRequestLlmQualityMode(), model: getTaskLlmConfig('edit').model }; })
   ]);
-  assert.deepEqual(standard, { mode: 'standard', model: 'gpt-5.4-mini' });
-  assert.deepEqual(deep, { mode: 'deep', model: 'gpt-5.2' });
+  assert.deepEqual(standard, { mode: 'standard', model: LLM_QUALITY_PROFILES.standard.edit.model });
+  assert.deepEqual(deep, { mode: 'deep', model: LLM_QUALITY_PROFILES.deep.edit.model });
   assert.equal(getRequestLlmQualityMode(), '');
 });
 

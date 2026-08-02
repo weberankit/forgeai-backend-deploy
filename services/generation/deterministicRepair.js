@@ -3,11 +3,18 @@ import * as parser from '@babel/parser';
 import { mergeFiles } from './generatedFileValidation.js';
 import { normalizeProjectPath } from './pathSafety.js';
 import { validateProjectSymbols } from '../review/symbolValidation.js';
+import { sanitizePackageJson } from './packageSafety.js';
 
 export function runDeterministicRepairs(previousFiles = [], proposedFiles = [], manifest = null) {
   const proposedPaths = new Set(proposedFiles.map((file) => normalizeProjectPath(file.path)));
   let combined = mergeFiles(previousFiles, proposedFiles);
   const repairs = [];
+  combined = combined.map((file) => {
+    if (!proposedPaths.has(file.path) || file.path !== 'package.json') return file;
+    const content = sanitizePackageJson(String(file.content || ''));
+    if (content !== file.content) repairs.push({ code: 'MANAGED_DEPENDENCY_VERSION', file: file.path, line: null, action: 'Normalized managed frontend dependencies to compatible platform versions.' });
+    return { ...file, content };
+  });
   combined = combined.map((file) => proposedPaths.has(file.path) ? repairDuplicateStatements(file, repairs) : file);
   combined = repairRelativePaths(combined, proposedPaths, manifest, repairs);
   combined = repairImportExportContracts(combined, proposedPaths, repairs);

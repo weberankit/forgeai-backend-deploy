@@ -9,20 +9,51 @@ import { repairMissingRelativeImports } from './importRepair.js';
 import { buildKnownPitfallsPrompt, retrieveVerifiedFixes } from '../memory/verifiedFixMemory.js';
 import { runDeterministicRepairs } from './deterministicRepair.js';
 import { assertDisjointWriteSets, assertOwnedBatchFiles, buildProjectManifest, manifestForBatch } from './projectManifest.js';
+import { withProjectCallLog } from '../observability/centralCallLogger.js';
+import { managedDependencyVersions } from './packageSafety.js';
+import { normalizeGenerationWarnings } from '../../utils/generationWarnings.js';
 
 export function getGenerationPlan(blueprint) {
   return buildGenerationBatches(blueprint);
 }
 
+export function selectActiveGenerationBatches(batches, { selectedFiles = [], failedBatch = 0 } = {}) {
+  if (Array.isArray(selectedFiles) && selectedFiles.length) {
+    const selectedSet = new Set(selectedFiles.map(normalizeProjectPath));
+    return batches
+      .map((batch) => ({ ...batch, files: batch.files.filter((filePath) => selectedSet.has(filePath)) }))
+      .filter((batch) => batch.files.length);
+  }
+  const retryFromBatch = Number(failedBatch || 0);
+  if (Number.isInteger(retryFromBatch) && retryFromBatch > 0) {
+    return batches.filter((batch) => batch.batchNumber >= retryFromBatch);
+  }
+  return batches;
+}
+
 export async function generateProjectFiles(project, options = {}) {
+  const plannedBatches = buildGenerationBatches(project.blueprint || {});
+  return withProjectCallLog({
+    projectId: project.projectId,
+    operation: options.selectedFiles?.length || project.failedBatch ? 'project_regeneration' : 'project_generation',
+    qualityMode: project.qualityMode,
+    metadata: { batchCount: plannedBatches.length, selectedFileCount: options.selectedFiles?.length || 0 }
+  }, async (telemetry) => {
+    telemetry.recordEvent('generation_started', { batchCount: plannedBatches.length });
+    const result = await generateProjectFilesInternal(project, options, telemetry);
+    telemetry.recordEvent('generation_ready', { fileCount: result.generatedFiles?.length || 0 });
+    telemetry.recordOutcome('ready_for_preview', { fileCount: result.generatedFiles?.length || 0 });
+    return result;
+  });
+}
+
+async function generateProjectFilesInternal(project, options = {}, telemetry) {
   const batches = buildGenerationBatches(project.blueprint || {});
   const manifest = buildProjectManifest(project.blueprint || {}, batches);
   project.generationManifest = manifest;
-  const selectedSet = Array.isArray(options.selectedFiles) && options.selectedFiles.length
-    ? new Set(options.selectedFiles.map(normalizeProjectPath))
-    : null;
+  const retryFromBatch = Number(project.failedBatch || 0);
   const contracts = [];
-  const warnings = [...(project.generationWarnings || [])];
+  const warnings = normalizeGenerationWarnings(project.generationWarnings || []);
   let existingFiles = project.generatedFiles || [];
   let lastValidProjectFiles = [...existingFiles];
 
@@ -33,9 +64,10 @@ export async function generateProjectFiles(project, options = {}) {
   await project.save();
 
   try {
-    const activeBatches = selectedSet
-      ? batches.map((batch) => ({ ...batch, files: batch.files.filter((filePath) => selectedSet.has(filePath)) })).filter((batch) => batch.files.length)
-      : batches;
+    const activeBatches = selectActiveGenerationBatches(batches, {
+      selectedFiles: options.selectedFiles,
+      failedBatch: retryFromBatch
+    });
 
     if (activeBatches.length === 0) throw new Error('No matching files were selected for generation.');
 
@@ -144,6 +176,7 @@ export async function generateProjectFiles(project, options = {}) {
       }
     }
 
+    telemetry.recordEvent('validation_started', { generatedFileCount: project.generatedFiles?.length || 0 });
     project.generationStatus = 'validating';
     project.generationProgress = 90;
     await project.save();
@@ -152,6 +185,7 @@ export async function generateProjectFiles(project, options = {}) {
     project.dependencyGraph = runStaticValidation(project.generatedFiles || []).graph;
     let smokeRenderTest = runSmokeRenderTests(project.generatedFiles || []);
     if (!smokeRenderTest.passed) {
+      telemetry.recordEvent('smoke_render_failed', { errorCount: smokeRenderTest.errors.length }, 'ERROR');
       await runFixLoop(project, {
         runtimeOutput: 'Smoke/render test failed: ' + smokeRenderTest.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '),
         maxAttempts: 2
@@ -188,13 +222,14 @@ export async function generateProjectFiles(project, options = {}) {
     await project.save();
     return project;
   } catch (error) {
+    telemetry.recordEvent('generation_failed', { errorType: error?.name || 'Error', batchNumber: project.currentBatch || 0 }, 'ERROR');
     project.generatedFiles = lastValidProjectFiles;
     project.lastValidProjectFiles = lastValidProjectFiles;
     project.dependencyGraph = runStaticValidation(lastValidProjectFiles).graph;
     project.generationStatus = 'failed';
     project.failedBatch = project.currentBatch || null;
     project.generationError = error.message;
-    project.generationWarnings = [...new Set([...warnings, error.message])];
+    project.generationWarnings = normalizeGenerationWarnings([...warnings, error.message]);
     await project.save();
     throw error;
   }
@@ -250,6 +285,7 @@ export async function repairGenerationBatch({ project, batch, generated, previou
         fallback: repairFallback,
         agentName: batch.agentName,
         phase: batch.phase,
+        batchNumber: batch.batchNumber,
         dependencyContext: {
           manager: 'Frontend Manager Agent',
           repairOf: batch.agentName,
@@ -315,7 +351,7 @@ async function commitGeneratedFiles({ project, newFiles, previousFiles, warnings
 
   project.generatedFiles = proposedFiles;
   project.dependencyGraph = proposedValidation.graph;
-  project.generationWarnings = [...new Set(warnings)];
+  project.generationWarnings = normalizeGenerationWarnings(warnings);
   project.generationProgress = Math.max(project.generationProgress || 0, Math.round((completedBatches / totalBatches) * 85));
   await project.save();
 
@@ -412,7 +448,7 @@ function normalizeGenerationResult(result) {
   return {
     files: Array.isArray(result?.files) ? result.files : [],
     contracts: Array.isArray(result?.contracts) ? result.contracts : [],
-    warnings: Array.isArray(result?.warnings) ? result.warnings : []
+    warnings: normalizeGenerationWarnings(result?.warnings || [])
   };
 }
 
@@ -470,6 +506,7 @@ async function runGenerationBatch({ project, batch, batchIndex, totalBatches, pr
     fallback,
     agentName: batch.agentName,
     phase: batch.phase,
+    batchNumber: batch.batchNumber,
     dependencyContext: {
       manager: 'Frontend Manager Agent',
       agentName: batch.agentName,
@@ -571,7 +608,7 @@ function contentForPath(filePath, spec, blueprint) {
 }
 
 function packageJson(blueprint = {}) {
-  const versions = { '@vitejs/plugin-react': '^4.3.1', vite: '^5.4.2', react: '^18.3.1', 'react-dom': '^18.3.1', 'react-router-dom': '^6.26.1', 'lucide-react': '^0.468.0', tailwindcss: '^3.4.10', postcss: '^8.4.41', autoprefixer: '^10.4.20', '@reduxjs/toolkit': '^2.2.7', 'react-redux': '^9.1.2' };
+  const versions = managedDependencyVersions;
   const dependencies = {};
   for (const entry of blueprint.requiredDependencies || Object.keys(versions)) {
     const name = typeof entry === 'string' ? entry : entry?.name;

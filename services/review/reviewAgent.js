@@ -11,10 +11,11 @@ export async function runQualityReview({ project, runtimeOutput = '', runtimeEvi
   for (const warning of staticValidation.warnings) findings.push(toFinding(id++, warning.code === 'circular_import' ? 'medium' : 'low', 'maintainability', warning));
   for (const error of smokeRenderTest.errors) findings.push(toFinding(id++, 'blocker', 'smoke_render', error));
   for (const warning of smokeRenderTest.warnings) findings.push(toFinding(id++, 'low', 'smoke_render', warning));
-  if (/error|failed|exception/i.test(runtimeOutput || '')) {
+  const hasRuntimeFailure = Boolean(runtimeEvidence?.errorType) || /error|failed|exception/i.test(runtimeOutput || '');
+  if (hasRuntimeFailure) {
     findings.push({
       id: formatId(id++), severity: 'high', category: 'runtime', title: 'Runtime output contains an error',
-      description: trim(runtimeOutput), file: null, relatedFiles: changedFiles || [], rootCause: 'WebContainer or build output reported a runtime failure.',
+      description: trim(runtimeOutput || runtimeEvidence.message || 'Preview runtime failure'), file: null, relatedFiles: changedFiles || runtimeEvidence.lastChangedFiles || [], rootCause: 'WebContainer or build output reported a runtime failure.',
       recommendedChange: 'Inspect the reported stack trace and update the smallest affected file set.', verification: ['Restart preview and confirm the error no longer appears.']
     });
   }

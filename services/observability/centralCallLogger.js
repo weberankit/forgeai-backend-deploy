@@ -3,7 +3,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { withLangfuseObservation } from './langfuseTracing.js';
+import { withLangfuseObservation, withLangfuseProjectContext } from './langfuseTracing.js';
 
 const serviceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_LOG_PATH = path.resolve(serviceDirectory, '..', '..', 'logs', 'ai-agent-calls.jsonl');
@@ -14,16 +14,45 @@ export function centralCallLogPath() {
   return path.resolve(process.env.AI_CALL_LOG_PATH || DEFAULT_LOG_PATH);
 }
 
+export async function withProjectCallLog({ projectId, operation, qualityMode, metadata = {} }, callback) {
+  const projectMetadata = {
+    projectId: String(projectId || ''),
+    qualityMode,
+    ...metadata
+  };
+  const inheritedContext = callContext.getStore() || {};
+  const runProjectOperation = () => callContext.run({
+    ...inheritedContext,
+    projectId: String(projectId || '')
+  }, () => withCallLog({
+    type: 'agent_call',
+    operation,
+    provider: 'pipeline',
+    metadata: projectMetadata
+  }, callback));
+
+  if (inheritedContext.projectId === String(projectId || '')) {
+    return runProjectOperation();
+  }
+  return withLangfuseProjectContext({
+    projectId,
+    operation,
+    qualityMode,
+    metadata
+  }, runProjectOperation);
+}
+
 export async function withCallLog({ type, operation, provider, model, parentCallId, metadata, input }, callback) {
   const callId = randomUUID();
-  parentCallId ||= callContext.getStore()?.callId;
+  const inheritedContext = callContext.getStore() || {};
+  parentCallId ||= inheritedContext.callId;
   const startedAt = new Date();
   await writeCallEvent({ timestamp: startedAt.toISOString(), event: 'started', type, callId, parentCallId, operation, provider, model, metadata });
   try {
     const result = await withLangfuseObservation({
       type, operation, provider, model, metadata: sanitize(metadata), input
     }, (telemetry) => callContext.run(
-      { callId },
+      { ...inheritedContext, callId },
       () => callback({ callId, ...telemetry })
     ));
     await writeCallEvent({ timestamp: new Date().toISOString(), event: 'completed', type, callId, parentCallId, operation, provider, model, durationMs: Date.now() - startedAt.getTime(), metadata });

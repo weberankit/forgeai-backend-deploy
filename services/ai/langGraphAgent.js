@@ -27,6 +27,7 @@ const AgentState = Annotation.Root({
   warnings: Annotation(),
   agentName: Annotation(),
   phase: Annotation(),
+  batchNumber: Annotation(),
   dependencyContext: Annotation(),
   message: Annotation(),
   fallbackResult: Annotation(),
@@ -117,7 +118,7 @@ export async function runExplainGraph({ question, graphSummary, fallback }) {
   });
 }
 
-export async function runGenerationRepairGraph({ specification, blueprint, previousFiles, targetFiles, generatedFiles, validationError, contracts, warnings, fallback, agentName, phase, dependencyContext, attempt }) {
+export async function runGenerationRepairGraph({ specification, blueprint, previousFiles, targetFiles, generatedFiles, validationError, contracts, warnings, fallback, agentName, phase, batchNumber, dependencyContext, attempt }) {
   return runAgentGraph('generation_repair', generationRepairGraph, {
     task: 'generation_repair',
     specification,
@@ -130,13 +131,14 @@ export async function runGenerationRepairGraph({ specification, blueprint, previ
     warnings,
     agentName,
     phase,
+    batchNumber,
     dependencyContext,
     attempt,
     fallbackResult: fallback
   });
 }
 
-export async function runCodeGenerationGraph({ specification, blueprint, previousFiles, targetFiles, contracts, warnings, fallback, agentName, phase, dependencyContext }) {
+export async function runCodeGenerationGraph({ specification, blueprint, previousFiles, targetFiles, contracts, warnings, fallback, agentName, phase, batchNumber, dependencyContext }) {
   return runAgentGraph('code_generation', codeGenerationGraph, {
     task: 'code_generation',
     specification,
@@ -147,6 +149,7 @@ export async function runCodeGenerationGraph({ specification, blueprint, previou
     warnings,
     agentName,
     phase,
+    batchNumber,
     dependencyContext,
     fallbackResult: fallback
   });
@@ -155,7 +158,7 @@ export async function runCodeGenerationGraph({ specification, blueprint, previou
 async function runAgentGraph(operation, graph, state) {
   return withCallLog({
     type: 'agent_call', operation, provider: 'langgraph',
-    metadata: { task: state.task, agentName: state.agentName, phase: state.phase, attempt: state.attempt }
+    metadata: { task: state.task, agentName: state.agentName, phase: state.phase, batchNumber: state.batchNumber, attempt: state.attempt }
   }, async ({ callId }) => {
     const result = await graph.invoke({ ...state, parentCallId: callId });
     return result.result;
@@ -241,7 +244,8 @@ async function generationRepairNode(state) {
     operation: 'generation_repair',
     prompt,
     fallbackResult: state.fallbackResult,
-    validator: validateCodeGenerationResponse
+    validator: validateCodeGenerationResponse,
+    routingContext: { phase: state.phase, agentName: state.agentName, batchNumber: state.batchNumber }
   });
   return { result };
 }
@@ -262,25 +266,35 @@ async function codeGenerationNode(state) {
     operation: 'code_generation',
     prompt,
     fallbackResult: state.fallbackResult,
-    validator: validateCodeGenerationResponse
+    validator: validateCodeGenerationResponse,
+    routingContext: { phase: state.phase, agentName: state.agentName, batchNumber: state.batchNumber }
   });
   return { result };
 }
 
-async function callStructuredAgent({ operation, prompt, fallbackResult, validator, onToken, inputImages = [] }) {
-  const config = getTaskLlmConfig(operation);
+async function callStructuredAgent({ operation, prompt, fallbackResult, validator, onToken, inputImages = [], routingContext = {} }) {
+  const config = getTaskLlmConfig(operation, routingContext);
   const { provider } = config;
   let attemptPrompt = prompt;
   for (let attempt = 1; attempt <= config.maxRetries; attempt += 1) {
     try {
-      const raw = await withCallLog({
+      return await withCallLog({
         type: 'ai_call', operation, provider,
         model: provider === 'openai' ? config.model : 'local-fallback',
         input: attemptPrompt,
-        metadata: { attempt, qualityMode: config.qualityMode, streaming: Boolean(onToken), promptLength: attemptPrompt.length, temperature: config.temperature, maxOutputTokens: config.maxOutputTokens }
-      }, ({ recordUsage }) => provider === 'openai' ? callOpenAI(attemptPrompt, config, { onToken, inputImages, onUsage: recordUsage }) : JSON.stringify(fallbackResult));
-      if (provider !== 'openai' && onToken) onToken(raw);
-      return parseStructuredResponse(raw, validator);
+        metadata: { attempt, qualityMode: config.qualityMode, agentName: config.agentName, phase: config.phase, batchNumber: routingContext.batchNumber, streaming: Boolean(onToken), promptLength: attemptPrompt.length, temperature: config.temperature, maxOutputTokens: config.maxOutputTokens }
+      }, async (telemetry) => {
+        const raw = provider === 'openai'
+          ? await callOpenAI(attemptPrompt, config, { onToken, inputImages, onUsage: telemetry.recordUsage })
+          : JSON.stringify(fallbackResult);
+        if (provider !== 'openai' && onToken) onToken(raw);
+        try {
+          return parseStructuredResponse(raw, validator);
+        } catch (error) {
+          telemetry.recordEvent('structured_output_invalid', { attempt, errorType: error?.name || 'Error' }, 'ERROR');
+          throw error;
+        }
+      });
     } catch (error) {
       if (isOpenAiCredentialError(error)) throw error;
       console.warn('LangGraph structured agent output failed', { operation, attempt, message: error.message });

@@ -3,6 +3,7 @@ import { httpError } from '../../utils/httpError.js';
 import { assertUniquePaths, normalizeProjectPath } from './pathSafety.js';
 import { sanitizePackageJson, validatePackageJson } from './packageSafety.js';
 import { validateProjectSymbols } from '../review/symbolValidation.js';
+import { toPlainGeneratedFile } from './generatedFileObjects.js';
 
 const requiredFiles = ['package.json', 'index.html', 'src/main.jsx', 'src/App.jsx'];
 const blockedPathPatterns = [/^server\//i, /^api\//i, /Dockerfile/i, /docker-compose/i, /auth/i, /jwt/i, /oauth/i, /mongoose/i, /mongodb/i, /express/i];
@@ -50,8 +51,14 @@ function assertManifestExports(files, manifest, scopedPathSet = null) {
 
 export function mergeFiles(existingFiles, newFiles) {
   const map = new Map();
-  for (const file of existingFiles || []) map.set(normalizeProjectPath(file.path), { ...file, path: normalizeProjectPath(file.path) });
-  for (const file of newFiles || []) map.set(normalizeProjectPath(file.path), { ...file, path: normalizeProjectPath(file.path), content: String(file.content || '') });
+  for (const file of existingFiles || []) {
+    const plain = toPlainGeneratedFile(file);
+    map.set(plain.path, plain);
+  }
+  for (const file of newFiles || []) {
+    const plain = toPlainGeneratedFile(file);
+    map.set(plain.path, plain);
+  }
   return Array.from(map.values());
 }
 

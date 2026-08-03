@@ -2,13 +2,14 @@ import path from 'path';
 import * as parser from '@babel/parser';
 import traverseModule from '@babel/traverse';
 import { normalizeProjectPath } from '../generation/pathSafety.js';
+import { toPlainGeneratedFiles } from '../generation/generatedFileObjects.js';
 
 const traverse = traverseModule.default || traverseModule;
 const extensions = ['', '.js', '.jsx', '.css', '/index.js', '/index.jsx'];
 
 export function validateProjectSymbols(files = []) {
   const findings = [];
-  const normalized = files.map((file) => ({ ...file, path: normalizeProjectPath(file.path), content: String(file.content || '') }));
+  const normalized = toPlainGeneratedFiles(files);
   const fileMap = new Map(normalized.map((file) => [file.path, file]));
   const tables = {};
   for (const file of normalized) {
@@ -96,7 +97,10 @@ function collectTopLevel(statement, declarations, file, findings) {
 
 function validateImports(filePath, table, tables, fileMap, findings) {
   for (const imported of table.imports) {
-    if (!imported.source.startsWith('.')) continue;
+    if (!imported.source.startsWith('.')) {
+      validateKnownPackageImports(filePath, imported, findings);
+      continue;
+    }
     const resolved = resolveImport(filePath, imported.source, fileMap);
     if (!resolved) {
       findings.push(issue('MISSING_RELATIVE_MODULE', filePath, imported.line, null, 'Missing relative import: ' + imported.source, 'Resolve the path from the manifest or create the planned module.'));
@@ -107,6 +111,22 @@ function validateImports(filePath, table, tables, fileMap, findings) {
     for (const specifier of imported.specifiers) {
       if (specifier.kind === 'named' && !target.namedExports.has(specifier.imported)) findings.push(issue('MISSING_NAMED_EXPORT', filePath, imported.line, specifier.imported, resolved + ' does not export ' + specifier.imported, 'Correct the import name or the authoritative module export.'));
       if (specifier.kind === 'default' && target.defaultExports === 0) findings.push(issue('MISSING_DEFAULT_EXPORT', filePath, imported.line, specifier.local, resolved + ' has no default export.', 'Use a named import or add the contracted default export.'));
+    }
+  }
+}
+
+function validateKnownPackageImports(filePath, imported, findings) {
+  if (imported.source !== 'tailwind-merge') return;
+  for (const specifier of imported.specifiers) {
+    if (specifier.kind === 'named' && specifier.imported === 'tailwindMerge') {
+      findings.push(issue(
+        'MISSING_PACKAGE_EXPORT',
+        filePath,
+        imported.line,
+        specifier.imported,
+        'tailwind-merge does not export tailwindMerge; import twMerge instead.',
+        'Replace tailwindMerge with twMerge while preserving the local binding when necessary.'
+      ));
     }
   }
 }

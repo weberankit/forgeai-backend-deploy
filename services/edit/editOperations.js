@@ -1,4 +1,5 @@
 import { normalizeProjectPath, languageForPath } from '../generation/pathSafety.js';
+import { toPlainGeneratedFiles } from '../generation/generatedFileObjects.js';
 
 const createRoots = ['src/pages/', 'src/components/', 'src/layouts/', 'src/hooks/', 'src/utils/', 'src/data/'];
 const createExtensions = ['.js', '.jsx', '.css', '.json'];
@@ -42,7 +43,7 @@ export function validateEditOperations(existingFiles, proposedChanges, approvedT
 }
 
 export function applyEditOperationsToFiles(existingFiles, changes, operationId = '') {
-  const byPath = new Map((existingFiles || []).map((file) => [normalizeProjectPath(file.path), { ...file }]));
+  const byPath = new Map(toPlainGeneratedFiles(existingFiles).map((file) => [file.path, file]));
   const now = new Date();
   for (const change of changes) {
     if (change.operation === 'delete') {

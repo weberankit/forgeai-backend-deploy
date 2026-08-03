@@ -1,6 +1,6 @@
 import { withCallLog } from '../observability/centralCallLogger.js';
 import { getTaskLlmConfig } from '../../config/taskLlmConfig.js';
-import { fetchLlmResponse } from './llmTransport.js';
+import { fetchLlmResponse, readLlmResponse } from './llmTransport.js';
 import { isOpenAiCredentialError } from './openAiErrors.js';
 import { buildVisionPrompt } from './prompts/visionPrompt.js';
 
@@ -11,13 +11,13 @@ export async function describeImage(image) {
 
   const fallback = fallbackDescription(image);
   const config = getTaskLlmConfig('vision');
-  if (config.provider !== 'openai' || !config.apiKey) return fallback;
+  if (config.provider === 'mock' || !config.apiKey) return fallback;
 
   try {
     const { model } = config;
     const dataUrl = 'data:' + image.mimetype + ';base64,' + image.buffer.toString('base64');
     const data = await withCallLog({
-      type: 'ai_call', operation: 'image_description', provider: 'openai', model,
+      type: 'ai_call', operation: 'image_description', provider: config.provider, model,
       input: { prompt: buildVisionPrompt(), image: { mimeType: image.mimetype, imageBytes: image.size } },
       metadata: { qualityMode: config.qualityMode, mimeType: image.mimetype, imageBytes: image.size, temperature: config.temperature, maxOutputTokens: config.maxOutputTokens }
     }, async ({ recordUsage }) => {
@@ -39,13 +39,13 @@ export async function describeImage(image) {
       });
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error?.message || 'OpenAI vision request failed');
+        throw new Error(errorData.error?.message || errorData.message || 'LLM vision request failed');
       }
-      const responseData = await response.json();
-      recordUsage(responseData.usage);
-      return responseData;
+      const result = await readLlmResponse(response, config);
+      recordUsage(result.usage);
+      return result;
     });
-    const text = data.output_text || data.output?.flatMap((item) => item.content || []).map((part) => part.text || '').join('\n') || '';
+    const text = data.text || '';
     return normalizeVisionResult(parseJson(text), image, model);
   } catch (error) {
     if (isOpenAiCredentialError(error)) throw error;

@@ -16,6 +16,8 @@ export function runDeterministicRepairs(previousFiles = [], proposedFiles = [], 
     return { ...file, content };
   });
   combined = combined.map((file) => proposedPaths.has(file.path) ? repairDuplicateStatements(file, repairs) : file);
+  combined = combined.map((file) => proposedPaths.has(file.path) ? repairKnownPackageImports(file, repairs) : file);
+  combined = combined.map((file) => proposedPaths.has(file.path) ? repairCssImportOrder(file, repairs) : file);
   combined = repairRelativePaths(combined, proposedPaths, manifest, repairs);
   combined = repairImportExportContracts(combined, proposedPaths, repairs);
   combined = repairManifestExports(combined, proposedPaths, manifest, repairs);
@@ -24,6 +26,45 @@ export function runDeterministicRepairs(previousFiles = [], proposedFiles = [], 
   combined = combined.map((file) => proposedPaths.has(file.path) ? repairDuplicateStatements(file, repairs) : file);
   const repaired = combined.filter((file) => proposedPaths.has(file.path));
   return { files: repaired, repairs, validation: validateProjectSymbols(combined) };
+}
+
+export function repairKnownPackageImports(file, repairs = []) {
+  if (!/\.(js|jsx)$/.test(file.path)) return file;
+  let ast;
+  try { ast = parser.parse(file.content, { sourceType: 'module', plugins: ['jsx'], errorRecovery: true, ranges: true }); } catch { return file; }
+  const replacements = [];
+  for (const statement of ast.program.body) {
+    if (statement.type !== 'ImportDeclaration' || statement.source.value !== 'tailwind-merge') continue;
+    for (const specifier of statement.specifiers || []) {
+      if (specifier.type !== 'ImportSpecifier' || specifier.imported?.name !== 'tailwindMerge') continue;
+      const localName = specifier.local?.name || 'tailwindMerge';
+      replacements.push([specifier.start, specifier.end, 'twMerge as ' + localName]);
+      repairs.push({
+        code: 'MISSING_PACKAGE_EXPORT',
+        file: file.path,
+        line: specifier.loc?.start.line,
+        action: 'Replaced invalid tailwindMerge package import with twMerge while preserving the local binding.'
+      });
+    }
+  }
+  if (!replacements.length) return file;
+  let content = file.content;
+  for (const [start, end, value] of replacements.sort((a, b) => b[0] - a[0])) content = content.slice(0, start) + value + content.slice(end);
+  return { ...file, content };
+}
+
+export function repairCssImportOrder(file, repairs = []) {
+  if (!/\.css$/i.test(file.path) || !/@import\s+/i.test(file.content || '')) return file;
+  const lines = String(file.content || '').split('\n');
+  const imports = lines.filter((line) => /^\s*@import\s+/i.test(line));
+  if (!imports.length) return file;
+  const firstNonImport = lines.findIndex((line) => line.trim() && !/^\s*@(?:charset|import)\s+/i.test(line));
+  const misplaced = lines.some((line, index) => /^\s*@import\s+/i.test(line) && firstNonImport >= 0 && index > firstNonImport);
+  if (!misplaced) return file;
+  const body = lines.filter((line) => !/^\s*@import\s+/i.test(line));
+  const content = [...imports, '', ...body].join('\n').replace(/\n{3,}/g, '\n\n');
+  repairs.push({ code: 'CSS_IMPORT_ORDER', file: file.path, line: null, action: 'Moved CSS @import statements before Tailwind directives and other style rules.' });
+  return { ...file, content };
 }
 
 function repairManifestExports(files, proposedPaths, manifest, repairs) {

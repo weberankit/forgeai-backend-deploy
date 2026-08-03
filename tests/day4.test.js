@@ -383,7 +383,7 @@ test('applies graph-targeted natural language edits with fallback in mock mode',
     async save() {}
   };
   const result = await applyNaturalLanguageEdit(project, 'change button text to "Buy now"');
-  assert.equal(result.status, 'preview_ready');
+  assert.equal(result.status, 'edit_verification_pending');
   assert.match(project.generatedFiles.find((file) => file.path === 'src/pages/HomePage.jsx').content, /Buy now/);
 });
 

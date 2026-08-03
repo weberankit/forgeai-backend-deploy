@@ -1,12 +1,15 @@
 import { randomUUID } from 'crypto';
-import { applyFileChanges, createSnapshot } from './versioningService.js';
+import { applyFileChanges, createSnapshot, restoreLatestSnapshot } from './versioningService.js';
 import { runQualityReview } from './reviewAgent.js';
 import { runStaticValidation } from './staticValidation.js';
 import { storeVerifiedFixCandidate } from '../memory/verifiedFixMemory.js';
 import { runGenerationRepairGraph } from '../ai/langGraphAgent.js';
 import { isOpenAiCredentialError } from '../ai/openAiErrors.js';
 import { repairMissingRelativeImports } from '../generation/importRepair.js';
+import { repairCssImportOrder, repairKnownPackageImports } from '../generation/deterministicRepair.js';
+import { buildFocusedRepairContext } from './repairContext.js';
 import { languageForPath, normalizeProjectPath } from '../generation/pathSafety.js';
+import { toPlainGeneratedFiles } from '../generation/generatedFileObjects.js';
 import path from 'path';
 import { withProjectCallLog } from '../observability/centralCallLogger.js';
 import { httpError } from '../../utils/httpError.js';
@@ -15,6 +18,41 @@ export function assertRepairableProject(project) {
   if (!project?.generatedFiles?.length) {
     throw httpError(409, 'Project has no persisted generated files to repair. Generate the project again before running preview repair.');
   }
+}
+
+export function applyRepairVerification(project, { buildPassed, previewPassed, changedFiles = [], error = '' }) {
+  const normalizedChangedFiles = [...new Set((changedFiles || []).map(normalizeProjectPath))];
+  const expected = new Set((project.lastChangedFiles || []).map(normalizeProjectPath));
+  const verifiedFiles = normalizedChangedFiles.filter((filePath) => expected.has(filePath));
+  const completeChangedSet = expected.size > 0 && verifiedFiles.length === expected.size;
+  const verificationPassed = project.operationStatus === 'fix_applied' && buildPassed === true && previewPassed === true && completeChangedSet;
+  const failedChanges = verificationPassed ? [] : (project.generatedFiles || [])
+    .filter((file) => verifiedFiles.includes(normalizeProjectPath(file.path)))
+    .slice(0, 4)
+    .map((file) => ({ path: normalizeProjectPath(file.path), content: String(file.content || '').slice(0, 4_000) }));
+  const latestReview = project.reviewHistory?.[project.reviewHistory.length - 1];
+  const verificationResult = {
+    buildPassed: buildPassed === true,
+    previewPassed: previewPassed === true,
+    changedFiles: verifiedFiles,
+    failedChanges,
+    error: String(error || '').slice(0, 4_000),
+    verifiedAt: new Date()
+  };
+  if (latestReview) latestReview.verificationResult = verificationResult;
+  if (verificationPassed) {
+    project.operationStatus = 'repair_verified';
+    project.lastSuccessfulPreviewAt = new Date();
+    return { status: 'passed', verificationResult, rolledBack: false };
+  }
+  const snapshot = restoreLatestSnapshot(project);
+  project.operationStatus = 'repair_verification_failed';
+  return {
+    status: 'failed',
+    reason: verificationResult.error || 'WebContainer build or preview verification failed.',
+    verificationResult,
+    rolledBack: Boolean(snapshot)
+  };
 }
 
 export async function runFixLoop(project, options = {}) {
@@ -44,12 +82,24 @@ async function runFixLoopInternal(project, { runtimeOutput = '', runtimeEvidence
   const appliedChanges = [];
   const requiresPreviewVerification = Boolean(String(runtimeOutput || '').trim() || runtimeEvidence?.errorType);
   let pendingVerifiedFix = null;
+  let previousAttempt = previousFailedRepair(project);
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     telemetry.recordEvent('repair_attempt_started', { attempt });
     const review = await runQualityReview({ project, runtimeOutput, runtimeEvidence, attempt });
     runs.push(review);
     project.reviewHistory.push(review);
     if (review.status === 'passed') {
+      if (requiresPreviewVerification && !appliedChanges.length) {
+        telemetry.recordEvent('repair_no_progress', { attempt, reason: 'preview_failure_unresolved' }, 'ERROR');
+        runtimeOutput = [
+          runtimeOutput,
+          'The original preview failure is still unresolved and no repair has been applied. Do not report success until a meaningful file change passes validation.'
+        ].filter(Boolean).join('\n\n');
+        if (attempt < maxAttempts) continue;
+        project.operationStatus = 'human_escalation';
+        await project.save();
+        return { status: 'no_progress', reason: 'Preview failure remained unresolved and no validated file changes were applied.', review, attempts: runs, appliedChanges };
+      }
       project.operationStatus = 'review_passed';
       project.dependencyGraph = review.staticValidation.graph;
       if (pendingVerifiedFix) {
@@ -65,7 +115,7 @@ async function runFixLoopInternal(project, { runtimeOutput = '', runtimeEvidence
       await project.save();
       return { status: 'passed', review, attempts: runs, appliedChanges };
     }
-    const fixResult = await produceFixes(project, review, attempt);
+    const fixResult = await produceFixes(project, review, attempt, previousAttempt);
     const meaningfulChanges = filterMeaningfulChanges(project.generatedFiles || [], fixResult.changes || []);
     if (!meaningfulChanges.length) {
       telemetry.recordEvent('repair_no_progress', { attempt }, 'ERROR');
@@ -83,7 +133,12 @@ async function runFixLoopInternal(project, { runtimeOutput = '', runtimeEvidence
     if (!validation.passed) {
       telemetry.recordEvent('repair_validation_failed', { attempt, errorCount: validation.errors.length }, 'ERROR');
       project.operationStatus = 'fix_validation_failed';
-      runtimeOutput = validation.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; ');
+      const validationOutput = validation.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; ');
+      previousAttempt = { changes: meaningfulChanges, validationError: validationOutput };
+      runtimeOutput = [
+        runtimeOutput,
+        'The proposed repair failed static validation:\n' + validationOutput
+      ].filter(Boolean).join('\n\n');
       continue;
     }
     createSnapshot(project, 'fix', 'Attempt ' + attempt + ' for findings ' + fixResult.resolvedFindingIds.join(', '));
@@ -107,7 +162,19 @@ async function runFixLoopInternal(project, { runtimeOutput = '', runtimeEvidence
       };
     }
   }
-  const finalReview = await runQualityReview({ project, runtimeOutput: '', runtimeEvidence, attempt: maxAttempts + 1 });
+  // A runtime/build failure is never cleared by an extra review. The only valid
+  // success path is an applied patch followed by WebContainer verification.
+  if (requiresPreviewVerification) {
+    project.operationStatus = 'human_escalation';
+    await project.save();
+    return {
+      status: 'no_progress',
+      reason: 'Repair attempts were exhausted without a statically valid patch. The original preview failure remains unresolved.',
+      attempts: runs,
+      appliedChanges: [...new Set(appliedChanges)]
+    };
+  }
+  const finalReview = await runQualityReview({ project, runtimeOutput, runtimeEvidence, attempt: maxAttempts + 1 });
   runs.push(finalReview);
   project.reviewHistory.push(finalReview);
   if (finalReview.status === 'passed') {
@@ -122,8 +189,21 @@ async function runFixLoopInternal(project, { runtimeOutput = '', runtimeEvidence
   return { status: 'escalated', attempts: runs, appliedChanges: [...new Set(appliedChanges)] };
 }
 
-export async function produceFixes(project, review, attempt = 1) {
-  const llmFix = await produceDynamicLlmFixes(project, review, attempt).catch((error) => {
+function previousFailedRepair(project) {
+  const reviews = project.reviewHistory || [];
+  for (let index = reviews.length - 1; index >= 0; index -= 1) {
+    const verification = reviews[index]?.verificationResult;
+    if (verification?.buildPassed === false || verification?.previewPassed === false) {
+      return { changes: verification.failedChanges || [], validationError: verification.error || 'Previous WebContainer verification failed.' };
+    }
+  }
+  return null;
+}
+
+export async function produceFixes(project, review, attempt = 1, previousAttempt = null) {
+  const knownFix = produceKnownPackageFixes(project, review, attempt);
+  if (knownFix.changes.length) return knownFix;
+  const llmFix = await produceDynamicLlmFixes(project, review, attempt, previousAttempt).catch((error) => {
     if (isOpenAiCredentialError(error)) throw error;
     return null;
   });
@@ -146,7 +226,38 @@ export async function produceFixes(project, review, attempt = 1) {
   return { changes: dedupe(changes), verificationSteps: ['Run static validation', 'Refresh preview'], resolvedFindingIds: changes.flatMap((change) => change.addressesFindingIds), unresolvedIssues: [], requiresFullReview: true };
 }
 
-async function produceDynamicLlmFixes(project, review, attempt) {
+function produceKnownPackageFixes(project, review, attempt) {
+  const files = new Map((project.generatedFiles || []).map((file) => [normalizeProjectPath(file.path), file]));
+  const changes = [];
+  for (const finding of review.findings || []) {
+    if (!['blocker', 'high'].includes(finding.severity) || !finding.file) continue;
+    const filePath = normalizeProjectPath(finding.file);
+    const file = files.get(filePath);
+    if (!file) continue;
+    const description = finding.description || '';
+    let repaired = file;
+    if (/tailwind-merge does not export tailwindMerge/i.test(description)) repaired = repairKnownPackageImports(repaired);
+    if (/css|@import|stylesheet/i.test(description + ' ' + filePath)) repaired = repairCssImportOrder(repaired);
+    if (String(repaired.content || '') === String(file.content || '')) continue;
+    changes.push({
+      path: filePath,
+      changeType: 'update',
+      content: repaired.content,
+      language: file.language || languageForPath(filePath),
+      reason: 'Deterministic runtime repair attempt ' + attempt + ': repair a known package or stylesheet build failure.',
+      addressesFindingIds: [finding.id]
+    });
+  }
+  return {
+    changes: dedupe(changes),
+    verificationSteps: ['Run static validation', 'Refresh WebContainer preview'],
+    resolvedFindingIds: changes.flatMap((change) => change.addressesFindingIds),
+    unresolvedIssues: [],
+    requiresFullReview: true
+  };
+}
+
+async function produceDynamicLlmFixes(project, review, attempt, previousAttempt) {
   const blocking = (review.findings || []).filter((finding) => ['blocker', 'high'].includes(finding.severity));
   if (!blocking.length) return null;
   const files = project.generatedFiles || [];
@@ -159,26 +270,29 @@ async function produceDynamicLlmFixes(project, review, attempt) {
     const base = normalizeProjectPath(path.posix.join(path.posix.dirname(error.file), specifier));
     targetPaths.add(/\.(js|jsx)$/.test(base) ? base : base + (/\/hooks\//.test(base) ? '.js' : '.jsx'));
   }
-  const targets = [...targetPaths];
-  if (!targets.length) return null;
+  const requestedTargets = [...targetPaths];
+  if (!requestedTargets.length) return null;
   const current = new Map(files.map((file) => [normalizeProjectPath(file.path), file]));
+  const context = buildFocusedRepairContext({ project, review, targetPaths: requestedTargets, validation, previousAttempt });
+  const targets = context.targetPaths;
+  if (!targets.length) return null;
   const result = await runGenerationRepairGraph({
-    specification: project.expandedSpec,
-    blueprint: project.blueprint,
-    previousFiles: files.filter((file) => !targets.includes(normalizeProjectPath(file.path))),
-    targetFiles: targets,
-    generatedFiles: targets.map((filePath) => current.get(filePath)).filter(Boolean),
+    specification: context.specification,
+    blueprint: context.blueprint,
+    previousFiles: context.supportingFiles,
+    targetFiles: context.targetPaths,
+    generatedFiles: context.targetFiles,
     validationError: [
       review.runtimeOutput ? 'Runtime error:\n' + review.runtimeOutput : '',
       validation.errors.length ? 'Static validation:\n' + validation.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; ') : ''
     ].filter(Boolean).join('\n\n'),
     contracts: [],
-    warnings: project.generationWarnings || [],
+    warnings: (project.generationWarnings || []).slice(-20),
     fallback: { files: repairMissingRelativeImports(files).filter((file) => targets.includes(normalizeProjectPath(file.path))), contracts: [], warnings: [] },
     agentName: 'Dynamic Preview Repair Agent',
     phase: 'runtime_and_import_repair',
     batchNumber: null,
-    dependencyContext: { runtimeEvidence: review.runtimeEvidence || {}, findings: blocking, dependencyGraph: validation.graph, instruction: 'Use the runtime stack, source, route, symbols, and related graph files to identify the root cause. Create missing modules and correct imports/exports. Never delete a required feature import merely to pass validation.' },
+    dependencyContext: { ...context.dependencyContext, repairContextStats: context.stats },
     attempt
   });
   const changes = (result?.files || []).filter((file) => targets.includes(normalizeProjectPath(file.path))).map((file) => ({
@@ -186,14 +300,14 @@ async function produceDynamicLlmFixes(project, review, attempt) {
     changeType: current.has(normalizeProjectPath(file.path)) ? 'update' : 'create',
     content: String(file.content || ''),
     language: file.language || languageForPath(file.path),
-    reason: 'Dynamic LLM repair attempt ' + attempt + ': ' + validation.errors.map((item) => item.message).join('; '),
+    reason: 'Dynamic LLM repair attempt ' + attempt + ': ' + [review.runtimeOutput, ...validation.errors.map((item) => item.message)].filter(Boolean).join('; ').slice(0, 1000),
     addressesFindingIds: blocking.map((finding) => finding.id)
   }));
   return { changes: dedupe(changes), verificationSteps: ['Run static validation', 'Refresh WebContainer preview'], resolvedFindingIds: blocking.map((finding) => finding.id), unresolvedIssues: [], requiresFullReview: true };
 }
 
 export function resolveRuntimeRepairTargets(project, runtimeOutput = '', runtimeEvidence = {}, maxTargets = 8) {
-  const files = project.generatedFiles || [];
+  const files = toPlainGeneratedFiles(project.generatedFiles || []);
   const paths = files.map((file) => normalizeProjectPath(file.path));
   const pathSet = new Set(paths);
   const graph = project.dependencyGraph && Object.keys(project.dependencyGraph).length
@@ -203,10 +317,17 @@ export function resolveRuntimeRepairTargets(project, runtimeOutput = '', runtime
   const selected = new Set();
   const add = (filePath) => { if (pathSet.has(filePath) && selected.size < maxTargets) selected.add(filePath); };
 
-  for (const filePath of paths) {
+  const errorLines = evidenceText.split('\n').filter((line) => /error|failed|cannot|unable|resolve|unexpected|warning|@import/i.test(line));
+  const scores = paths.map((filePath) => {
     const basename = path.posix.basename(filePath);
-    if (evidenceText.includes(filePath) || (basename.length > 3 && evidenceText.includes(basename))) add(filePath);
-  }
+    let score = evidenceText.includes(filePath) ? 100 : 0;
+    if (basename.length > 3 && evidenceText.includes(basename)) score += 20;
+    if (errorLines.some((line) => line.includes(filePath))) score += 300;
+    if (basename.length > 3 && errorLines.some((line) => line.includes(basename))) score += 150;
+    if (String(runtimeEvidence.source || '').includes(filePath) || String(runtimeEvidence.source || '').includes(basename)) score += 500;
+    return { filePath, score };
+  }).filter((item) => item.score > 0).sort((a, b) => b.score - a.score);
+  for (const item of scores) add(item.filePath);
   for (const changed of [...(runtimeEvidence.lastChangedFiles || []), ...(project.lastChangedFiles || [])]) {
     try { add(normalizeProjectPath(changed)); } catch {}
   }
@@ -252,7 +373,7 @@ function extractRuntimeSymbols(text) {
 function escapeRegExp(value) { return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 function applyChangesInMemory(files, changes) {
-  const map = new Map((files || []).map((file) => [normalizeProjectPath(file.path), { ...file }]));
+  const map = new Map(toPlainGeneratedFiles(files).map((file) => [file.path, file]));
   for (const change of changes || []) {
     const filePath = normalizeProjectPath(change.path);
     map.set(filePath, { ...(map.get(filePath) || {}), path: filePath, language: change.language || languageForPath(filePath), content: String(change.content || '') });

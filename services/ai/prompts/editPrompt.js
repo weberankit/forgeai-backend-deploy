@@ -18,8 +18,8 @@ export function buildEditPrompt({ project, message, targetFiles, dependencyConte
     'User edit request:',
     message,
     '',
-    'Project summary:',
-    JSON.stringify({ name: project?.name, expandedSpec: project?.expandedSpec, blueprint: project?.blueprint }, null, 2),
+    'File permissions and target files with current content:',
+    JSON.stringify(targetFiles || [], null, 2),
     '',
     'Dependency context from project graph:',
     JSON.stringify(dependencyContext || {}, null, 2),
@@ -27,7 +27,7 @@ export function buildEditPrompt({ project, message, targetFiles, dependencyConte
     'Known pitfalls to avoid from verified fix memory:',
     dependencyContext?.knownPitfalls || 'No verified pitfalls matched this context.',
     '',
-    'Target files with current content:',
-    JSON.stringify(targetFiles || [], null, 2)
+    'Focused project summary:',
+    JSON.stringify(project || {}, null, 2)
   ].join('\n');
 }

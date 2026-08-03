@@ -9,8 +9,11 @@ import { buildRetryPrompt } from './prompts/retryPrompt.js';
 import { parseStructuredResponse, validateBlueprint, validateExpansionSpec } from './parseStructuredResponse.js';
 import { withCallLog } from '../observability/centralCallLogger.js';
 import { getTaskLlmConfig } from '../../config/taskLlmConfig.js';
-import { fetchLlmResponse } from './llmTransport.js';
+import { fetchLlmResponse, readLlmResponse, readLlmStream } from './llmTransport.js';
 import { isOpenAiCredentialError } from './openAiErrors.js';
+
+export const MAX_REPAIR_PROMPT_CHARS = 40_000;
+export const MAX_EDIT_PROMPT_CHARS = 40_000;
 
 const AgentState = Annotation.Root({
   task: Annotation(),
@@ -245,7 +248,12 @@ async function generationRepairNode(state) {
     prompt,
     fallbackResult: state.fallbackResult,
     validator: validateCodeGenerationResponse,
-    routingContext: { phase: state.phase, agentName: state.agentName, batchNumber: state.batchNumber }
+    routingContext: {
+      phase: state.phase,
+      agentName: state.agentName,
+      batchNumber: state.batchNumber,
+      repairContextStats: state.dependencyContext?.repairContextStats
+    }
   });
   return { result };
 }
@@ -275,19 +283,19 @@ async function codeGenerationNode(state) {
 async function callStructuredAgent({ operation, prompt, fallbackResult, validator, onToken, inputImages = [], routingContext = {} }) {
   const config = getTaskLlmConfig(operation, routingContext);
   const { provider } = config;
-  let attemptPrompt = prompt;
+  let attemptPrompt = boundAgentPrompt(operation, prompt);
   for (let attempt = 1; attempt <= config.maxRetries; attempt += 1) {
     try {
       return await withCallLog({
         type: 'ai_call', operation, provider,
-        model: provider === 'openai' ? config.model : 'local-fallback',
+        model: provider !== 'mock' ? config.model : 'local-fallback',
         input: attemptPrompt,
-        metadata: { attempt, qualityMode: config.qualityMode, agentName: config.agentName, phase: config.phase, batchNumber: routingContext.batchNumber, streaming: Boolean(onToken), promptLength: attemptPrompt.length, temperature: config.temperature, maxOutputTokens: config.maxOutputTokens }
+        metadata: { attempt, qualityMode: config.qualityMode, agentName: config.agentName, phase: config.phase, batchNumber: routingContext.batchNumber, streaming: Boolean(onToken), promptLength: attemptPrompt.length, temperature: config.temperature, maxOutputTokens: config.maxOutputTokens, ...(routingContext.repairContextStats || {}) }
       }, async (telemetry) => {
-        const raw = provider === 'openai'
-          ? await callOpenAI(attemptPrompt, config, { onToken, inputImages, onUsage: telemetry.recordUsage })
+        const raw = provider !== 'mock'
+          ? await callProvider(attemptPrompt, config, { onToken, inputImages, onUsage: telemetry.recordUsage })
           : JSON.stringify(fallbackResult);
-        if (provider !== 'openai' && onToken) onToken(raw);
+        if (provider === 'mock' && onToken) onToken(raw);
         try {
           return parseStructuredResponse(raw, validator);
         } catch (error) {
@@ -298,7 +306,7 @@ async function callStructuredAgent({ operation, prompt, fallbackResult, validato
     } catch (error) {
       if (isOpenAiCredentialError(error)) throw error;
       console.warn('LangGraph structured agent output failed', { operation, attempt, message: error.message });
-      attemptPrompt = buildRetryPrompt(prompt, error);
+      attemptPrompt = boundAgentPrompt(operation, buildRetryPrompt(prompt, error));
       if (attempt === config.maxRetries) {
         if (fallbackResult) {
           console.warn('LangGraph agent exhausted retries; using validated local fallback', { operation, message: error.message });
@@ -311,7 +319,17 @@ async function callStructuredAgent({ operation, prompt, fallbackResult, validato
   }
 }
 
-async function callOpenAI(prompt, config, { onToken, inputImages = [], onUsage } = {}) {
+export function boundAgentPrompt(operation, prompt) {
+  const value = String(prompt || '');
+  const limit = operation === 'generation_repair' ? MAX_REPAIR_PROMPT_CHARS : operation === 'edit' ? MAX_EDIT_PROMPT_CHARS : null;
+  if (!limit || value.length <= limit) return value;
+  const marker = operation === 'generation_repair'
+    ? '\n\n[Optional trailing repair context removed to keep this request within the 40,000-character safety limit.]'
+    : '\n\n[Optional trailing context removed to keep this request within the 40,000-character safety limit.]';
+  return value.slice(0, limit - marker.length) + marker;
+}
+
+async function callProvider(prompt, config, { onToken, inputImages = [], onUsage } = {}) {
   const input = inputImages.length
     ? [{
         role: 'user',
@@ -324,50 +342,12 @@ async function callOpenAI(prompt, config, { onToken, inputImages = [], onUsage }
   const response = await fetchLlmResponse(config, { input, stream: Boolean(onToken) });
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
-    throw new Error(data.error?.message || 'OpenAI request failed');
+    throw new Error(data.error?.message || data.message || 'LLM provider request failed');
   }
-  if (onToken) return readOpenAIStream(response, onToken, onUsage);
-  const data = await response.json();
-  onUsage?.(data.usage);
-  return data.output_text || data.output?.flatMap((item) => item.content || []).map((part) => part.text).join('\n');
-}
-
-async function readOpenAIStream(response, onToken, onUsage) {
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let output = '';
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split('\n\n');
-    buffer = parts.pop() || '';
-    for (const part of parts) {
-      for (const line of part.split('\n')) {
-        if (!line.startsWith('data:')) continue;
-        const payload = line.slice(5).trim();
-        if (!payload || payload === '[DONE]') continue;
-        const event = JSON.parse(payload);
-        const delta = event.delta || event.text || event?.item?.content?.[0]?.text || '';
-        if (event.type === 'response.output_text.delta' && delta) {
-          output += delta;
-          onToken(delta);
-        }
-        if (event.type === 'response.completed') {
-          onUsage?.(event.response?.usage);
-          const finalText = event.response?.output_text || event.response?.output?.flatMap((item) => item.content || []).map((content) => content.text || '').join('\n');
-          if (finalText && finalText.length > output.length) {
-            const tail = finalText.slice(output.length);
-            output = finalText;
-            onToken(tail);
-          }
-        }
-      }
-    }
-  }
-  return output;
+  if (onToken) return readLlmStream(response, config, onToken, onUsage);
+  const result = await readLlmResponse(response, config);
+  onUsage?.(result.usage);
+  return result.text;
 }
 
 function validateCodeGenerationResponse(value) {

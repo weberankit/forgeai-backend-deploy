@@ -7,7 +7,16 @@ export function runWithRequestLlmContext(context, callback) {
 }
 
 export function getRequestOpenAiApiKey() {
-  return requestLlmStorage.getStore()?.openAiApiKey || '';
+  return getRequestLlmApiKey();
+}
+
+export function getRequestLlmApiKey() {
+  const context = requestLlmStorage.getStore();
+  return context?.llmApiKey || context?.openAiApiKey || '';
+}
+
+export function getRequestLlmProvider() {
+  return requestLlmStorage.getStore()?.provider || '';
 }
 
 export function getRequestLlmQualityMode() {

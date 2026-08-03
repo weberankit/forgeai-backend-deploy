@@ -1,9 +1,13 @@
+import { buildEditInteractionIndex, rankInteractionTargets } from './editInteractionIndex.js';
+
 export function resolveEditTargets(project, message) {
   const text = normalizeEditMessage(message);
   const files = project.generatedFiles || [];
   const graph = project.dependencyGraph || {};
   const messageTokens = tokens(text);
   const explicitTargets = inferExplicitTargets(project, files, text);
+  const interactionCandidates = rankInteractionTargets(buildEditInteractionIndex(files), text);
+  for (const candidate of interactionCandidates) candidate.reasons = (candidate.evidence || []).map((value) => 'interaction:' + value);
   const scored = [];
   for (const file of files) {
     if (!/\.(jsx|js|css)$/.test(file.path)) continue;
@@ -34,6 +38,7 @@ export function resolveEditTargets(project, message) {
   scored.sort((a, b) => b.score - a.score);
   const seeds = scored.slice(0, 4);
   const targets = new Set(explicitTargets);
+  for (const candidate of interactionCandidates.slice(0, 3)) targets.add(candidate.path);
   for (const seed of seeds) targets.add(seed.path);
   if (!targets.size) {
     for (const filePath of project.lastChangedFiles || []) if (files.some((file) => file.path === filePath)) targets.add(filePath);
@@ -48,9 +53,12 @@ export function resolveEditTargets(project, message) {
     if (targets.size >= 8) break;
   }
   return {
-    confidence: explicitTargets.length || seeds[0]?.score >= 12 ? 'high' : seeds.length ? 'medium' : 'low',
+    confidence: explicitTargets.length || interactionCandidates[0]?.score >= 12 || seeds[0]?.score >= 12 ? 'high' : seeds.length || interactionCandidates.length ? 'medium' : 'low',
     targets: [...targets].slice(0, 8),
-    candidates: seeds,
+    editableTargets: [...new Set([...explicitTargets, ...interactionCandidates.slice(0, 3).map((item) => item.path), ...seeds.map((item) => item.path)])].slice(0, 6),
+    candidates: [...interactionCandidates, ...seeds].slice(0, 8),
+    interactionEvidence: interactionCandidates.slice(0, 6),
+    ...inferCreationRequest(project, text),
     needsClarification: false
   };
 }
@@ -84,6 +92,20 @@ function inferExplicitTargets(project, files, text) {
     for (const file of files) if (/^src\/styles\/.*\.(js|css)$/.test(file.path)) add(file.path);
   }
   return targets;
+}
+
+function inferCreationRequest(project, text) {
+  const match = text.match(/\b(?:add|create|build|make)\s+(?:a\s+|an\s+|new\s+)*(?:new\s+)?([a-z][a-z0-9 -]{1,40}?)\s+page\b/i);
+  if (!match) return { creationIntent: false, creatableFiles: [] };
+  const words = match[1].trim().split(/\s+/).filter(Boolean);
+  const component = words.map((word) => word[0].toUpperCase() + word.slice(1)).join('');
+  const filePath = 'src/pages/' + component + '.jsx';
+  const exists = (project.generatedFiles || []).some((file) => file.path === filePath);
+  return {
+    creationIntent: !exists,
+    creatableFiles: exists ? [] : [filePath],
+    requestedRoute: '/' + words.join('-').toLowerCase()
+  };
 }
 
 function tokens(text) { return text.split(/[^a-z0-9]+/).filter((token) => token.length > 2 && !['the','and','use','with','make','add','remove','change','update','please','this','that','into','from','should','would','could','page','wanted','also'].includes(token)); }

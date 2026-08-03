@@ -1,11 +1,12 @@
 import { withCallLog } from '../observability/centralCallLogger.js';
 import { getTaskLlmConfig } from '../../config/taskLlmConfig.js';
-import { fetchLlmResponse } from '../ai/llmTransport.js';
+import { fetchLlmResponse, readLlmResponse } from '../ai/llmTransport.js';
 import { isOpenAiCredentialError } from '../ai/openAiErrors.js';
 import { buildEditTargetingPrompt, buildIntentPrompt } from '../ai/prompts/intentPrompt.js';
+import { buildEditInteractionIndex } from './editInteractionIndex.js';
 
 const allowedIntents = new Set(['edit', 'explain', 'build', 'unknown']);
-const allowedEditScopes = new Set(['focused', 'multi_file', 'whole_project', 'missing_target']);
+const allowedEditScopes = new Set(['focused', 'multi_file', 'whole_project', 'missing_target', 'create']);
 const allowedClarity = new Set(['clear', 'ambiguous']);
 const intentCache = new Map();
 const INTENT_CACHE_MS = 30_000;
@@ -16,7 +17,7 @@ export async function routeChatIntent(message) {
   const cached = intentCache.get(text);
   if (cached && Date.now() - cached.createdAt < INTENT_CACHE_MS) return cached.intent;
   const config = getTaskLlmConfig('intent');
-  if (config.provider === 'openai' && config.apiKey) {
+  if (config.provider !== 'mock' && config.apiKey) {
     for (let attempt = 1; attempt <= config.maxRetries; attempt += 1) {
       try {
         const intent = await classifyWithSmallModel(text, config);
@@ -41,7 +42,7 @@ function rememberIntent(message, intent) {
 async function classifyWithSmallModel(message, config) {
   const { model } = config;
   const data = await withCallLog({
-    type: 'ai_call', operation: 'intent_classification', provider: 'openai', model,
+    type: 'ai_call', operation: 'intent_classification', provider: config.provider, model,
     input: buildIntentPrompt(message),
     metadata: { qualityMode: config.qualityMode, messageLength: message.length, temperature: config.temperature, maxOutputTokens: config.maxOutputTokens }
   }, async ({ recordUsage }) => {
@@ -52,11 +53,11 @@ async function classifyWithSmallModel(message, config) {
       const errorData = await response.json().catch(() => ({}));
       throw new Error(errorData.error?.message || 'Intent model request failed');
     }
-    const responseData = await response.json();
-    recordUsage(responseData.usage);
-    return responseData;
+    const result = await readLlmResponse(response, config);
+    recordUsage(result.usage);
+    return result;
   });
-  const raw = data.output_text || data.output?.flatMap((item) => item.content || []).map((part) => part.text || '').join('\n') || '';
+  const raw = data.text || '';
   const parsed = JSON.parse(String(raw).trim().replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim());
   if (!allowedIntents.has(parsed.intent)) throw new Error('Intent model returned an unsupported intent');
   return parsed.intent;
@@ -75,7 +76,7 @@ function fallbackIntent(message) {
 export async function selectSemanticEditTargets(project, message, fallbackTargeting) {
   const fallback = { ...fallbackTargeting, strategy: 'deterministic_fallback' };
   const config = getTaskLlmConfig('intent');
-  if (config.provider !== 'openai' || !config.apiKey) return fallback;
+  if (config.provider === 'mock' || !config.apiKey) return fallback;
   const catalog = buildEditFileCatalog(project);
   if (!catalog.length) return fallback;
   for (let attempt = 1; attempt <= config.maxRetries; attempt += 1) {
@@ -94,6 +95,7 @@ function buildEditFileCatalog(project) {
   const graph = project.dependencyGraph || {};
   const planned = new Map((project.blueprint?.fileList || []).map((file) => [file.path, file]));
   const routes = project.blueprint?.routes || [];
+  const interactions = buildEditInteractionIndex(project.generatedFiles || []);
   return (project.generatedFiles || [])
     .filter((file) => ['.js', '.jsx', '.css'].some((extension) => file.path.endsWith(extension)))
     .slice(0, 80)
@@ -107,7 +109,8 @@ function buildEditFileCatalog(project) {
         route: route?.path || undefined,
         exports: (node.exports || []).slice(0, 12),
         renders: (node.renders || []).slice(0, 12),
-        imports: (node.imports || []).slice(0, 12)
+        imports: (node.imports || []).slice(0, 12),
+        interactions: interactions[file.path] || undefined
       };
     });
 }
@@ -115,7 +118,7 @@ function buildEditFileCatalog(project) {
 async function selectTargetsWithSmallModel(message, catalog, config, attempt) {
   const prompt = buildEditTargetingPrompt(message, catalog);
   const data = await withCallLog({
-    type: 'ai_call', operation: 'edit_targeting', provider: 'openai', model: config.model,
+    type: 'ai_call', operation: 'edit_targeting', provider: config.provider, model: config.model,
     input: prompt,
     metadata: { attempt, qualityMode: config.qualityMode, messageLength: String(message || '').length, catalogSize: catalog.length, maxOutputTokens: config.maxOutputTokens }
   }, async ({ recordUsage }) => {
@@ -124,17 +127,19 @@ async function selectTargetsWithSmallModel(message, catalog, config, attempt) {
       const errorData = await response.json().catch(() => ({}));
       throw new Error(errorData.error?.message || 'Edit target model request failed');
     }
-    const responseData = await response.json();
-    recordUsage(responseData.usage);
-    return responseData;
+    const result = await readLlmResponse(response, config);
+    recordUsage(result.usage);
+    return result;
   });
-  const raw = data.output_text || data.output?.flatMap((item) => item.content || []).map((part) => part.text || '').join('\n') || '';
+  const raw = data.text || '';
   const parsed = JSON.parse(String(raw).trim().replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim());
   const available = new Set(catalog.map((file) => file.path));
   const targets = [...new Set((parsed.targets || []).filter((filePath) => available.has(filePath)))].slice(0, 6);
   const scope = allowedEditScopes.has(parsed.scope) ? parsed.scope : 'focused';
   const clarity = allowedClarity.has(parsed.clarity) ? parsed.clarity : 'clear';
-  const needsClarification = parsed.needsClarification === true || clarity === 'ambiguous' || scope === 'missing_target';
+  // The explicit decision is authoritative. `clarity: ambiguous` may lower
+  // confidence, but must not contradict needsClarification: false.
+  const needsClarification = parsed.needsClarification === true || (scope === 'missing_target' && parsed.needsClarification !== false);
   const clarificationQuestion = String(parsed.clarificationQuestion || '').trim().slice(0, 500);
   if (needsClarification && !clarificationQuestion) throw new Error('Edit target model did not provide a clarification question');
   if (!needsClarification && !targets.length) throw new Error('Edit target model did not select an available project file');
@@ -154,6 +159,22 @@ async function selectTargetsWithSmallModel(message, catalog, config, attempt) {
 }
 
 function finalizeSemanticTargets(project, selected, fallback) {
+  if (fallback.creationIntent) {
+    const available = new Set((project.generatedFiles || []).map((file) => file.path));
+    const integrationTargets = ['src/App.jsx', 'src/components/Navigation.jsx', 'src/components/Header.jsx'].filter((filePath) => available.has(filePath));
+    return {
+      ...fallback,
+      ...selected,
+      scope: 'create',
+      needsClarification: false,
+      targets: [...new Set([...integrationTargets, ...(selected.targets || [])])].slice(0, 6),
+      editableTargets: [...new Set([...integrationTargets, ...(selected.targets || [])])].slice(0, 6),
+      readOnlyTargets: [],
+      creatableFiles: fallback.creatableFiles,
+      requestedRoute: fallback.requestedRoute,
+      strategy: 'hybrid_creation'
+    };
+  }
   if (selected.needsClarification) {
     return {
       ...fallback,
@@ -164,10 +185,15 @@ function finalizeSemanticTargets(project, selected, fallback) {
   }
   const graph = project.dependencyGraph || {};
   const available = new Set((project.generatedFiles || []).map((file) => file.path));
-  const targets = new Set(selected.targets);
-  for (const seed of selected.targets) {
+  const editableTargets = new Set([...(selected.targets || []), ...(fallback.editableTargets || [])]);
+  const targets = new Set(editableTargets);
+  const readOnlyTargets = new Set();
+  for (const seed of [...editableTargets]) {
     for (const related of [...(graph[seed]?.imports || []), ...(graph[seed]?.importedBy || [])]) {
-      if (available.has(related) && ['.js', '.jsx', '.css'].some((extension) => related.endsWith(extension))) targets.add(related);
+      if (available.has(related) && ['.js', '.jsx', '.css'].some((extension) => related.endsWith(extension))) {
+        targets.add(related);
+        if (!editableTargets.has(related)) readOnlyTargets.add(related);
+      }
       if (targets.size >= 8) break;
     }
     if (targets.size >= 8) break;
@@ -176,7 +202,11 @@ function finalizeSemanticTargets(project, selected, fallback) {
     ...fallback,
     ...selected,
     targets: [...targets].slice(0, 8),
+    editableTargets: [...editableTargets].slice(0, 6),
+    readOnlyTargets: [...readOnlyTargets].slice(0, 4),
+    interactionEvidence: fallback.interactionEvidence || [],
     strategy: 'ai_semantic',
+    targetingMethod: 'hybrid_ast_semantic',
     needsClarification: false
   };
 }

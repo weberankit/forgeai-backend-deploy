@@ -1,15 +1,19 @@
 import { LLM_PROFILES, getLlmProfile } from './llmProfiles.js';
-import { getRequestLlmQualityMode, getRequestOpenAiApiKey } from '../context/requestLlmContext.js';
+import { getRequestLlmApiKey, getRequestLlmQualityMode } from '../context/requestLlmContext.js';
 import { normalizeLlmQualityMode } from './llmQualityMode.js';
 import { httpError } from '../utils/httpError.js';
-import { OPENAI_API_KEY_REQUIRED } from '../services/ai/openAiErrors.js';
+import { LLM_API_KEY_REQUIRED, OPENAI_API_KEY_REQUIRED } from '../services/ai/openAiErrors.js';
+import { getConfiguredLlmProvider, getLlmBaseUrl, getServerLlmApiKey } from './llmProvider.js';
 
 export function getTaskLlmConfig(task, context = {}) {
   const qualityMode = normalizeLlmQualityMode(getRequestLlmQualityMode(), 'standard');
-  const profile = getLlmProfile(task, qualityMode, context);
+  const configuredProvider = getConfiguredLlmProvider();
+  const profile = getLlmProfile(task, qualityMode, context, configuredProvider);
   if (!profile) throw new Error('Unknown LLM task: ' + task + '. Expected: ' + Object.keys(LLM_PROFILES).join(', '));
-  const requestApiKey = getRequestOpenAiApiKey();
-  const provider = requestApiKey ? 'openai' : 'mock';
+  const requestApiKey = getRequestLlmApiKey();
+  const serverApiKey = getServerLlmApiKey(configuredProvider);
+  const apiKey = requestApiKey || serverApiKey;
+  const provider = apiKey ? configuredProvider : 'mock';
 
   return {
     task,
@@ -18,8 +22,10 @@ export function getTaskLlmConfig(task, context = {}) {
     agentName: context.agentName,
     description: profile.description,
     provider,
-    apiKey: requestApiKey,
-    baseUrl: String(process.env.LLM_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, ''),
+    configuredProvider,
+    credentialSource: requestApiKey ? 'request' : serverApiKey ? 'server' : 'none',
+    apiKey,
+    baseUrl: getLlmBaseUrl(configuredProvider),
     model: profile.model,
     temperature: profile.temperature,
     maxOutputTokens: profile.maxOutputTokens,
@@ -34,13 +40,12 @@ export function listTaskLlmConfigs() {
 }
 
 export function requireTaskLlmApiKey(config) {
-  if (config.provider === 'openai' && !config.apiKey) {
+  if (config.provider !== 'mock' && !config.apiKey) {
     throw httpError(
       401,
-      'Add your OpenAI API key in Settings to use AI features.',
-      OPENAI_API_KEY_REQUIRED
+      'Add an API key for the configured LLM provider to use AI features.',
+      config.configuredProvider === 'openai' ? OPENAI_API_KEY_REQUIRED : LLM_API_KEY_REQUIRED
     );
   }
   return config.apiKey;
 }
-

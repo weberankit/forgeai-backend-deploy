@@ -78,6 +78,29 @@ test('symbol validation detects named/default mismatch and undefined JSX compone
   assert.ok(result.errors.some((error) => error.code === 'UNDEFINED_RENDERED_COMPONENT' && error.symbol === 'MissingCard'));
 });
 
+test('deterministic repair corrects the invalid tailwind-merge export before preview', () => {
+  const source = "import { tailwindMerge } from 'tailwind-merge'; export const cn = (...values) => tailwindMerge(values);";
+  const initial = validateProjectSymbols([{ path: 'src/components/ui/DataTable.jsx', content: source }]);
+  assert.ok(initial.errors.some((error) => error.code === 'MISSING_PACKAGE_EXPORT' && error.symbol === 'tailwindMerge'));
+
+  const result = runDeterministicRepairs([], [{ path: 'src/components/ui/DataTable.jsx', content: source }]);
+  const repaired = result.files[0].content;
+  assert.match(repaired, /import \{ twMerge as tailwindMerge \} from 'tailwind-merge'/);
+  assert.match(repaired, /tailwindMerge\(values\)/);
+  assert.equal(result.validation.passed, true);
+  assert.ok(result.repairs.some((repair) => repair.code === 'MISSING_PACKAGE_EXPORT'));
+});
+
+test('deterministic repair moves CSS imports before Tailwind directives', () => {
+  const result = runDeterministicRepairs([], [{
+    path: 'src/index.css',
+    language: 'css',
+    content: '@tailwind base;\n@tailwind components;\n@import url("https://fonts.example/inter.css");\nbody { margin: 0; }'
+  }]);
+  assert.match(result.files[0].content, /^@import url/);
+  assert.ok(result.repairs.some((repair) => repair.code === 'CSS_IMPORT_ORDER'));
+});
+
 test('symbol and smoke validation accept JSX components bound through aliased props or local scope', () => {
   const files = [
     { path: 'src/components/DataCard.jsx', content: "export default function DataCard({ icon: Icon }) { return <Icon aria-hidden='true' />; }" },

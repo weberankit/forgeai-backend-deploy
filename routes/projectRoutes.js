@@ -22,7 +22,9 @@ import {
   restoreProject,
   reviewProject,
   updateApproval,
-  updateProjectFiles
+  updateProjectFiles,
+  verifyProjectRepair,
+  verifyProjectEdit
 } from '../controllers/projectController.js';
 import { requireVisitor } from '../middleware/visitor.js';
 import { uploadImage } from '../middleware/upload.js';
@@ -44,8 +46,10 @@ router.post('/:projectId/generate/stream', requireOpenAiApiKey, generateProjectS
 router.post('/:projectId/regenerate', requireOpenAiApiKey, regenerateProject);
 router.post('/:projectId/review', reviewProject);
 router.post('/:projectId/fix', requireOpenAiApiKey, fixProject);
+router.post('/:projectId/fix/verify', verifyProjectRepair);
 router.post('/:projectId/intent', requireOpenAiApiKey, classifyProjectMessage);
 router.post('/:projectId/edit', requireOpenAiApiKey, editProject);
+router.post('/:projectId/edit/verify', verifyProjectEdit);
 router.post('/:projectId/explain', requireOpenAiApiKey, explainProject);
 router.post('/:projectId/deploy', deployProject);
 router.get('/:projectId/deployments', getProjectDeployments);

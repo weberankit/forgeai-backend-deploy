@@ -2,50 +2,91 @@ import { randomUUID } from 'crypto';
 import { resolveEditTargets } from './editTargeting.js';
 import { selectSemanticEditTargets } from './intentRouter.js';
 import { createSnapshot } from '../review/versioningService.js';
+import { restoreLatestSnapshot } from '../review/versioningService.js';
 import { applyEditOperationsToFiles, validateEditOperations } from './editOperations.js';
 import { runStaticValidation } from '../review/staticValidation.js';
-import { runFixLoop } from '../review/fixAgent.js';
 import { runEditGraph } from '../ai/langGraphAgent.js';
 import { isOpenAiCredentialError } from '../ai/openAiErrors.js';
 import { buildKnownPitfallsPrompt, retrieveVerifiedFixes } from '../memory/verifiedFixMemory.js';
+import { validateMinimalEditChanges } from './editChangeValidator.js';
+import { withProjectCallLog } from '../observability/centralCallLogger.js';
 
 export async function applyNaturalLanguageEdit(project, message) {
+  return withProjectCallLog({
+    projectId: project.projectId,
+    operation: 'project_edit',
+    qualityMode: project.qualityMode,
+    metadata: { messageLength: String(message || '').length }
+  }, (telemetry) => applyNaturalLanguageEditInternal(project, message, telemetry));
+}
+
+async function applyNaturalLanguageEditInternal(project, message, telemetry) {
   const request = buildEditRequest(project.pendingEditClarification, message);
   const refreshed = runStaticValidation(project.generatedFiles || []);
   project.dependencyGraph = refreshed.graph;
   const fallbackTargeting = resolveEditTargets(project, request.effectiveMessage);
   const targeting = await selectSemanticEditTargets(project, request.effectiveMessage, fallbackTargeting);
+  telemetry.recordEvent('edit_targets_selected', {
+    strategy: targeting.strategy,
+    editableTargets: targeting.editableTargets || targeting.targets,
+    readOnlyTargets: targeting.readOnlyTargets || [],
+    creatableFiles: targeting.creatableFiles || []
+  });
   if (targeting.needsClarification) {
-    return saveClarification(project, {
+    const result = await saveClarification(project, {
       question: targeting.clarificationQuestion || defaultClarificationQuestion(targeting),
       originalRequest: request.originalRequest,
       latestAnswer: request.latestAnswer,
       reason: targeting.clarificationReason || targeting.scope || 'request_unclear',
       targets: targeting.targets
     });
+    telemetry.recordOutcome('needs_clarification', { reason: result.reason });
+    return result;
   }
-  const editResult = await produceEditChanges(project, request.effectiveMessage, targeting);
-  if (!editResult.changes.length) {
-    return saveClarification(project, {
+  let editResult = { changes: [], warnings: [] };
+  let changes = [];
+  let validation = null;
+  let validationFeedback = '';
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    editResult = await produceEditChanges(project, request.effectiveMessage, targeting, validationFeedback);
+    const verifiedUnexpected = (editResult.rejectedChanges || []).filter((change) => canApproveUnexpectedTarget(project, targeting, change.path));
+    if (verifiedUnexpected.length) {
+      targeting.editableTargets = [...new Set([...(targeting.editableTargets || targeting.targets || []), ...verifiedUnexpected.map((change) => change.path)])].slice(0, 8);
+      targeting.targets = [...new Set([...(targeting.targets || []), ...verifiedUnexpected.map((change) => change.path)])].slice(0, 8);
+      validationFeedback = 'A related returned file was verified and is now editable. Return the complete patch using only the updated permissions.';
+      telemetry.recordEvent('edit_target_permission_expanded', { attempt, files: verifiedUnexpected.map((change) => change.path) });
+      continue;
+    }
+    if (!editResult.changes.length) {
+      validationFeedback = 'No permitted file change was returned. Use only editableFiles/creatableFiles and implement the requested behavior.';
+      telemetry.recordEvent('edit_no_permitted_changes', { attempt, rejectedFiles: (editResult.rejectedChanges || []).map((change) => change.path) }, 'ERROR');
+      if ((editResult.warnings || []).some((warning) => /Edit LLM failed|unavailable/i.test(String(warning)))) break;
+      continue;
+    }
+    try {
+      changes = validateEditOperations(project.generatedFiles || [], editResult.changes, targeting.editableTargets || targeting.targets, request.effectiveMessage);
+      const minimal = validateMinimalEditChanges(project.generatedFiles || [], changes, request.effectiveMessage);
+      if (!minimal.valid) throw new Error(minimal.errors.join('; '));
+      const proposedFiles = applyEditOperationsToFiles(project.generatedFiles || [], changes, 'validation-preview');
+      validation = runStaticValidation(proposedFiles);
+      if (!validation.passed) throw new Error(validation.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
+      break;
+    } catch (error) {
+      changes = [];
+      validationFeedback = 'Previous edit failed validation: ' + String(error.message || error).slice(0, 4_000) + '. Return a smaller corrected patch that preserves existing imports, exports, routes, and behavior.';
+      telemetry.recordEvent('edit_validation_failed', { attempt, message: String(error.message || error).slice(0, 500) }, 'ERROR');
+    }
+  }
+  if (!changes.length || !validation?.passed) {
+    const result = await saveClarification(project, {
       question: failedEditClarification(targeting),
       originalRequest: request.originalRequest,
       latestAnswer: request.latestAnswer,
-      reason: 'edit_generation_failed',
+      reason: editResult.changes.length ? 'edit_validation_failed' : 'edit_generation_failed',
       targets: targeting.targets
     });
-  }
-  let changes;
-  try {
-    changes = validateEditOperations(project.generatedFiles || [], editResult.changes, targeting.targets, request.effectiveMessage);
-  } catch (error) {
-    console.warn('Edit operations could not be applied safely', { message: error.message });
-    return saveClarification(project, {
-      question: failedEditClarification(targeting),
-      originalRequest: request.originalRequest,
-      latestAnswer: request.latestAnswer,
-      reason: 'edit_validation_failed',
-      targets: targeting.targets
-    });
+    telemetry.recordOutcome('needs_clarification', { reason: result.reason }, 'ERROR');
+    return result;
   }
   createSnapshot(project, 'edit', request.effectiveMessage);
   const operationId = randomUUID();
@@ -54,20 +95,45 @@ export async function applyNaturalLanguageEdit(project, message) {
   project.lastEditMessage = request.effectiveMessage;
   project.pendingEditClarification = null;
   project.operationStatus = 'validating';
-  const validation = runStaticValidation(project.generatedFiles || []);
   project.dependencyGraph = validation.graph;
-  if (!validation.passed) await runFixLoop(project, { maxAttempts: 2 });
-  else project.operationStatus = 'preview_ready';
+  project.operationStatus = 'edit_verification_pending';
   await project.save();
-  return { status: project.operationStatus, changes, targets: targeting.targets, warnings: editResult.warnings, validation };
+  const result = { status: project.operationStatus, changes, targets: targeting.targets, warnings: editResult.warnings, validation };
+  telemetry.recordOutcome('applied', { changedFiles: changes.map((change) => change.path), validationPassed: true });
+  return result;
 }
 
-async function produceEditChanges(project, message, targeting) {
-  const targets = targeting.targets;
+export function applyEditVerification(project, { buildPassed, previewPassed, changedFiles = [], error = '' }) {
+  const expected = new Set((project.lastChangedFiles || []).map(String));
+  const received = new Set((changedFiles || []).map(String));
+  const complete = expected.size > 0 && [...expected].every((filePath) => received.has(filePath));
+  const passed = project.operationStatus === 'edit_verification_pending' && buildPassed === true && previewPassed === true && complete;
+  const verification = {
+    buildPassed: buildPassed === true,
+    previewPassed: previewPassed === true,
+    changedFiles: [...received].filter((filePath) => expected.has(filePath)),
+    error: String(error || '').slice(0, 4_000),
+    verifiedAt: new Date()
+  };
+  if (passed) {
+    project.operationStatus = 'preview_ready';
+    project.lastSuccessfulPreviewAt = new Date();
+    return { status: 'passed', verification, rolledBack: false };
+  }
+  const snapshot = restoreLatestSnapshot(project);
+  project.operationStatus = 'edit_verification_failed';
+  return { status: 'failed', reason: verification.error || 'The edited project failed WebContainer verification.', verification, rolledBack: Boolean(snapshot) };
+}
+
+async function produceEditChanges(project, message, targeting, validationFeedback = '') {
+  const targets = targeting.targets || [];
+  const editableTargets = targeting.editableTargets?.length ? targeting.editableTargets : targets;
+  const readOnlyTargets = targeting.readOnlyTargets || targets.filter((target) => !editableTargets.includes(target));
   const targetFiles = (project.generatedFiles || [])
     .filter((file) => targets.includes(file.path))
-    .map((file) => ({ path: file.path, language: file.language, content: file.content }));
-  const fallbackChanges = produceDeterministicEditChanges(project, message, targets);
+    .map((file) => ({ path: file.path, language: file.language, access: editableTargets.includes(file.path) ? 'editable' : 'read_only', content: file.content }));
+  const boundedFiles = boundEditFiles(targetFiles);
+  const fallbackChanges = produceDeterministicEditChanges(project, message, editableTargets);
   const graph = project.dependencyGraph || {};
   const knownPitfalls = await retrieveVerifiedFixes({
     category: 'edit',
@@ -78,25 +144,67 @@ async function produceEditChanges(project, message, targeting) {
   const dependencyContext = {
     targetGraph: Object.fromEntries(targets.map((target) => [target, graph[target] || {}])),
     targetSelection: targeting,
+    editableFiles: editableTargets,
+    readOnlyFiles: readOnlyTargets,
+    creatableFiles: targeting.creatableFiles || [],
+    requestedRoute: targeting.requestedRoute,
+    interactionEvidence: (targeting.interactionEvidence || []).map((item) => ({ path: item.path, score: item.score, evidence: item.evidence, interactions: item.interactions })),
+    validationFeedback,
     allowedCreateRoots: ['src/pages/', 'src/components/', 'src/layouts/', 'src/hooks/', 'src/utils/', 'src/data/'],
     knownPitfalls: buildKnownPitfallsPrompt(knownPitfalls)
   };
   const result = await runEditGraph({
-    project: { name: project.name, expandedSpec: project.expandedSpec, blueprint: project.blueprint },
+    project: focusedEditProjectSummary(project, targets),
     message,
-    targetFiles,
+    targetFiles: boundedFiles,
     dependencyContext,
     fallback: { changes: fallbackChanges, warnings: ['Edit LLM is unavailable; deterministic fallback was used.'] }
   }).catch((error) => {
     if (isOpenAiCredentialError(error)) throw error;
     return { changes: fallbackChanges, warnings: ['Edit LLM failed: ' + error.message] };
   });
-  const allowedTargets = new Set(targets);
+  const allowedTargets = new Set(editableTargets);
+  const creatableFiles = new Set(targeting.creatableFiles || []);
+  const rejectedChanges = (result.changes || []).filter((change) => {
+    const operation = change.operation || change.changeType || 'update';
+    return operation === 'create' ? !creatableFiles.has(change.path) : !allowedTargets.has(change.path);
+  });
   const changes = (result.changes || [])
-    .filter((change) => change.operation === 'create' || change.changeType === 'create' || allowedTargets.has(change.path))
+    .filter((change) => {
+      const operation = change.operation || change.changeType || 'update';
+      return operation === 'create' ? creatableFiles.has(change.path) : allowedTargets.has(change.path);
+    })
     .map((change) => ({ ...change, operation: change.operation || change.changeType || 'update', reason: change.reason || 'Applied requested edit: ' + message, addressesFindingIds: [] }))
     .slice(0, 8);
-  return { changes, warnings: result.warnings || [] };
+  return { changes, rejectedChanges, warnings: result.warnings || [] };
+}
+
+function boundEditFiles(files, budget = 26_000) {
+  let remaining = budget;
+  return files.map((file) => {
+    const content = String(file.content || '').slice(0, Math.max(0, remaining));
+    remaining -= content.length;
+    return { ...file, content, truncated: content.length < String(file.content || '').length };
+  });
+}
+
+function focusedEditProjectSummary(project, targets) {
+  const relevant = new Set(targets || []);
+  return {
+    name: project.name,
+    summary: project.expandedSpec?.projectSummary,
+    routes: (project.blueprint?.routes || []).filter((route) => relevant.has('src/App.jsx') || relevant.has('src/pages/' + route.component + '.jsx')).slice(0, 30),
+    files: (project.blueprint?.fileList || []).filter((file) => relevant.has(file.path)).map((file) => ({ path: file.path, responsibility: file.responsibility, exports: file.exports || file.expectedExports || [] }))
+  };
+}
+
+function canApproveUnexpectedTarget(project, targeting, filePath) {
+  if (!(project.generatedFiles || []).some((file) => file.path === filePath)) return false;
+  if ((targeting.readOnlyTargets || []).includes(filePath)) return false;
+  if ((targeting.interactionEvidence || []).some((item) => item.path === filePath && item.score >= 8)) return true;
+  const editable = new Set(targeting.editableTargets || targeting.targets || []);
+  const graph = project.dependencyGraph || {};
+  return [...editable].some((seed) => [...(graph[seed]?.imports || []), ...(graph[seed]?.importedBy || [])].includes(filePath));
 }
 
 function produceDeterministicEditChanges(project, message, targets) {

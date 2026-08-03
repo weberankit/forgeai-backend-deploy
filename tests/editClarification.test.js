@@ -176,7 +176,7 @@ test('a clarification answer is combined with the original request and applied',
       project,
       'Start with the Home page and modernize its typography'
     ));
-    assert.equal(result.status, 'preview_ready');
+    assert.equal(result.status, 'edit_verification_pending');
     assert.equal(project.pendingEditClarification, null);
     assert.match(project.generatedFiles.find((file) => file.path === 'src/pages/Home.jsx').content, /text-5xl/);
     assert.match(project.lastEditMessage, /Original edit request: Improve all pages/);

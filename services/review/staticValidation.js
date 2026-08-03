@@ -4,6 +4,7 @@ import { normalizeProjectPath } from '../generation/pathSafety.js';
 import { buildDependencyGraph, findCircularImports } from './dependencyGraph.js';
 import { validateProjectSymbols } from './symbolValidation.js';
 import { validateRouteIntegration } from './routeValidation.js';
+import { toPlainGeneratedFile } from '../generation/generatedFileObjects.js';
 
 const requiredFiles = ['package.json', 'index.html', 'src/main.jsx', 'src/App.jsx'];
 const blockedPatterns = [/^server\//i, /^api\//i, /Dockerfile/i, /docker-compose/i, /auth/i, /jwt/i, /oauth/i, /mongoose/i, /mongodb/i, /express/i];
@@ -16,11 +17,12 @@ export function runStaticValidation(files = []) {
 
   for (const file of files) {
     try {
-      const filePath = normalizeProjectPath(file.path);
+      const plainFile = toPlainGeneratedFile(file);
+      const filePath = plainFile.path;
       if (seen.has(filePath)) errors.push(issue('duplicate_path', 'Duplicate generated file path: ' + filePath, filePath));
       seen.add(filePath);
       if (blockedPatterns.some((pattern) => pattern.test(filePath))) errors.push(issue('disallowed_path', 'Disallowed frontend project path: ' + filePath, filePath));
-      normalized.push({ ...file, path: filePath, content: String(file.content || '') });
+      normalized.push(plainFile);
     } catch (error) {
       errors.push(issue('invalid_path', error.message, file.path || null));
     }

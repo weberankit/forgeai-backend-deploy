@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { normalizeProjectPath } from '../generation/pathSafety.js';
 import { upsertGeneratedFiles } from '../generation/codeGenerationService.js';
+import { toPlainGeneratedFiles } from '../generation/generatedFileObjects.js';
 
 export function createSnapshot(project, operationType, message = '') {
   project.fileSnapshots = project.fileSnapshots || [];
@@ -8,7 +9,7 @@ export function createSnapshot(project, operationType, message = '') {
     snapshotId: randomUUID(),
     operationType,
     message,
-    files: (project.generatedFiles || []).map((file) => ({ ...file })),
+    files: toPlainGeneratedFiles(project.generatedFiles || []),
     createdAt: new Date()
   });
   if (project.fileSnapshots.length > 10) project.fileSnapshots = project.fileSnapshots.slice(-10);
@@ -33,7 +34,7 @@ export function applyFileChanges(project, changes, operationType, operationId) {
 export function restoreLatestSnapshot(project) {
   const snapshot = project.fileSnapshots?.[project.fileSnapshots.length - 1];
   if (!snapshot) return null;
-  project.generatedFiles = snapshot.files.map((file) => ({ ...file, updatedAt: new Date() }));
+  project.generatedFiles = toPlainGeneratedFiles(snapshot.files).map((file) => ({ ...file, updatedAt: new Date() }));
   project.lastChangedFiles = snapshot.files.map((file) => file.path);
   project.operationStatus = 'restored';
   return snapshot;

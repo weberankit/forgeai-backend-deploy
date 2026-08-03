@@ -1,10 +1,11 @@
 import path from 'path';
 import { languageForPath, normalizeProjectPath } from './pathSafety.js';
+import { toPlainGeneratedFiles } from './generatedFileObjects.js';
 
 const importRegex = /import\s+(?:[^'";]+?\s+from\s+)?['"]([^'"]+)['"]/g;
 
 export function repairMissingRelativeImports(files = []) {
-  const normalized = files.map((file) => ({ ...file, path: normalizeProjectPath(file.path), content: String(file.content || '') }));
+  const normalized = toPlainGeneratedFiles(files);
   const byPath = new Map(normalized.map((file) => [file.path, file]));
   const additions = [];
 

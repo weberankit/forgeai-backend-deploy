@@ -8,9 +8,9 @@ import { generateProjectFiles, getGenerationPlan, upsertGeneratedFiles } from '.
 import { validateGeneratedFiles } from '../services/generation/generatedFileValidation.js';
 import { languageForPath, normalizeProjectPath } from '../services/generation/pathSafety.js';
 import { runQualityReview } from '../services/review/reviewAgent.js';
-import { assertRepairableProject, runFixLoop } from '../services/review/fixAgent.js';
+import { applyRepairVerification, assertRepairableProject, runFixLoop } from '../services/review/fixAgent.js';
 import { runStaticValidation } from '../services/review/staticValidation.js';
-import { applyNaturalLanguageEdit } from '../services/edit/editAgent.js';
+import { applyEditVerification, applyNaturalLanguageEdit } from '../services/edit/editAgent.js';
 import { routeChatIntent } from '../services/edit/intentRouter.js';
 import { restoreLatestSnapshot } from '../services/review/versioningService.js';
 import { explainProjectQuestion } from '../services/explain/explainAgent.js';
@@ -422,6 +422,37 @@ export async function fixProject(req, res, next) {
   } catch (error) { next(error); }
 }
 
+export async function verifyProjectRepair(req, res, next) {
+  try {
+    const project = await findVisitorProject(req.params.projectId, req.visitorId);
+    if (project.operationStatus !== 'fix_applied') throw httpError(409, 'No repair is currently awaiting WebContainer verification.');
+    const result = await withProjectCallLog({
+      projectId: project.projectId,
+      operation: 'project_repair_verification',
+      qualityMode: project.qualityMode,
+      metadata: { changedFileCount: Array.isArray(req.body.changedFiles) ? req.body.changedFiles.length : 0 }
+    }, async (telemetry) => {
+      const verification = applyRepairVerification(project, {
+        buildPassed: req.body.buildPassed,
+        previewPassed: req.body.previewPassed,
+        changedFiles: Array.isArray(req.body.changedFiles) ? req.body.changedFiles : [],
+        error: req.body.error
+      });
+      const failed = verification.status !== 'passed';
+      telemetry.recordEvent('repair_verification_' + verification.status, {
+        changedFileCount: verification.verificationResult.changedFiles.length,
+        buildPassed: verification.verificationResult.buildPassed,
+        previewPassed: verification.verificationResult.previewPassed,
+        rolledBack: verification.rolledBack
+      }, failed ? 'ERROR' : 'DEFAULT');
+      telemetry.recordOutcome(verification.status, { rolledBack: verification.rolledBack }, failed ? 'ERROR' : 'DEFAULT');
+      return verification;
+    });
+    await project.save();
+    res.json({ project: serializeProject(project), result });
+  } catch (error) { next(error); }
+}
+
 export async function classifyProjectMessage(req, res, next) {
   try {
     await findVisitorProject(req.params.projectId, req.visitorId);
@@ -445,9 +476,34 @@ export async function editProject(req, res, next) {
     if (chatId) {
       const chat = await findVisitorChat(chatId, req.visitorId);
       chat.messages.push({ messageId: randomUUID(), role: 'user', type: 'clarification', content: message, metadata: { projectId: project.projectId, intent: 'edit' } });
-      chat.messages.push({ messageId: randomUUID(), role: 'assistant', type: 'status', content: result.status === 'needs_clarification' ? result.clarification : 'Applied edit to generated files.', metadata: { projectId: project.projectId, changedFiles: result.changes?.map((change) => change.path) || [] } });
+      chat.messages.push({ messageId: randomUUID(), role: 'assistant', type: 'status', content: result.status === 'needs_clarification' ? result.clarification : 'Edit prepared and awaiting preview verification.', metadata: { projectId: project.projectId, changedFiles: result.changes?.map((change) => change.path) || [] } });
       await chat.save();
     }
+    res.json({ project: serializeProject(project), result });
+  } catch (error) { next(error); }
+}
+
+export async function verifyProjectEdit(req, res, next) {
+  try {
+    const project = await findVisitorProject(req.params.projectId, req.visitorId);
+    if (project.operationStatus !== 'edit_verification_pending') throw httpError(409, 'No edit is currently awaiting WebContainer verification.');
+    const result = await withProjectCallLog({
+      projectId: project.projectId,
+      operation: 'project_edit_verification',
+      qualityMode: project.qualityMode
+    }, async (telemetry) => {
+      const verification = applyEditVerification(project, {
+        buildPassed: req.body.buildPassed,
+        previewPassed: req.body.previewPassed,
+        changedFiles: req.body.changedFiles || [],
+        error: req.body.error || ''
+      });
+      const failed = verification.status !== 'passed';
+      telemetry.recordEvent('edit_verification_' + verification.status, { rolledBack: verification.rolledBack, changedFiles: verification.verification.changedFiles }, failed ? 'ERROR' : 'DEFAULT');
+      telemetry.recordOutcome(verification.status, { rolledBack: verification.rolledBack }, failed ? 'ERROR' : 'DEFAULT');
+      return verification;
+    });
+    await project.save();
     res.json({ project: serializeProject(project), result });
   } catch (error) { next(error); }
 }

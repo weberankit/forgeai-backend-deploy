@@ -17,15 +17,86 @@ export function runDeterministicRepairs(previousFiles = [], proposedFiles = [], 
   });
   combined = combined.map((file) => proposedPaths.has(file.path) ? repairDuplicateStatements(file, repairs) : file);
   combined = combined.map((file) => proposedPaths.has(file.path) ? repairKnownPackageImports(file, repairs) : file);
+  combined = combined.map((file) => proposedPaths.has(file.path) ? repairUnsafeFallbackExports(file, repairs) : file);
   combined = combined.map((file) => proposedPaths.has(file.path) ? repairCssImportOrder(file, repairs) : file);
   combined = repairRelativePaths(combined, proposedPaths, manifest, repairs);
   combined = repairImportExportContracts(combined, proposedPaths, repairs);
   combined = repairManifestExports(combined, proposedPaths, manifest, repairs);
   combined = repairUndefinedRenderedComponents(combined, proposedPaths, repairs);
   combined = repairRouteContracts(combined, proposedPaths, repairs);
+  combined = repairDuplicateRootProviders(combined, proposedPaths, repairs);
   combined = combined.map((file) => proposedPaths.has(file.path) ? repairDuplicateStatements(file, repairs) : file);
   const repaired = combined.filter((file) => proposedPaths.has(file.path));
   return { files: repaired, repairs, validation: validateProjectSymbols(combined) };
+}
+
+export function repairDuplicateRootProviders(files, proposedPaths = new Set(), repairs = []) {
+  const app = files.find((file) => normalizeProjectPath(file.path) === 'src/App.jsx');
+  const main = files.find((file) => normalizeProjectPath(file.path) === 'src/main.jsx');
+  if (!app || !main || !proposedPaths.has('src/main.jsx')) return files;
+  let content = String(main.content || '');
+  const appContent = String(app.content || '');
+  const providerNames = [...content.matchAll(/<([A-Z][A-Za-z0-9_$]*Provider)\b/g)]
+    .map((match) => match[1])
+    .filter((name, index, values) => values.indexOf(name) === index)
+    .filter((name) => new RegExp('<' + escapeRegex(name) + '\\b').test(appContent));
+  for (const name of providerNames) {
+    const opening = new RegExp('<' + escapeRegex(name) + '\\b[^>]*>', 'g');
+    const closing = new RegExp('</' + escapeRegex(name) + '\\s*>', 'g');
+    if (!opening.test(content) || !closing.test(content)) continue;
+    content = content.replace(opening, '').replace(closing, '');
+    content = removeImportedBinding(content, name);
+    repairs.push({
+      code: 'DUPLICATE_ROOT_PROVIDER',
+      file: 'src/main.jsx',
+      line: null,
+      action: 'Removed duplicate ' + name + ' from main.jsx because App.jsx already owns that provider.'
+    });
+  }
+  if (content === main.content) return files;
+  content = content.replace(/\n{3,}/g, '\n\n');
+  return files.map((file) => normalizeProjectPath(file.path) === 'src/main.jsx' ? { ...file, content } : file);
+}
+
+function removeImportedBinding(content, bindingName) {
+  let ast;
+  try { ast = parser.parse(content, { sourceType: 'module', plugins: ['jsx'], errorRecovery: true, ranges: true }); } catch { return content; }
+  const replacements = [];
+  for (const statement of ast.program.body) {
+    if (statement.type !== 'ImportDeclaration') continue;
+    const matching = (statement.specifiers || []).filter((specifier) => specifier.local?.name === bindingName);
+    if (!matching.length) continue;
+    if (statement.specifiers.length === matching.length) {
+      replacements.push([statement.start, statement.end, '']);
+      continue;
+    }
+    for (const specifier of matching) {
+      let start = specifier.start;
+      let end = specifier.end;
+      const after = content.slice(end, statement.source.start);
+      const before = content.slice(statement.start, start);
+      if (/^\s*,/.test(after)) end += after.match(/^\s*,/)[0].length;
+      else if (/,\s*$/.test(before)) start -= before.match(/,\s*$/)[0].length;
+      replacements.push([start, end, '']);
+    }
+  }
+  let result = content;
+  for (const [start, end, value] of replacements.sort((a, b) => b[0] - a[0])) result = result.slice(0, start) + value + result.slice(end);
+  return result;
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function repairUnsafeFallbackExports(file, repairs = []) {
+  if (!/\.(js|jsx)$/.test(file.path) || !String(file.content || '').includes('args[0] ?? null')) return file;
+  let content = String(file.content || '');
+  content = content.replace(/export function (mock[A-Za-z0-9_$]+)\(\.\.\.args\) \{ return args\[0\] \?\? null; \}/g, (_match, name) => safeMockExport(name));
+  content = content.replace(/export function (select[A-Za-z0-9_$]+)\(\.\.\.args\) \{ return args\[0\] \?\? null; \}/g, (_match, name) => safeSelectorExport(name));
+  if (content === file.content) return file;
+  repairs.push({ code: 'UNSAFE_NULL_FALLBACK', file: file.path, line: null, action: 'Replaced null collection/data fallbacks with type-safe empty values.' });
+  return { ...file, content };
 }
 
 export function repairKnownPackageImports(file, repairs = []) {
@@ -88,10 +159,39 @@ function repairManifestExports(files, proposedPaths, manifest, repairs) {
       if (!table.namedExports.has(name) && table.declarations.has(name)) {
         additions.push('export { ' + name + ' };');
         repairs.push({ code: 'MISSING_PLANNED_NAMED_EXPORT', file: filePath, line: null, action: 'Added the manifest-required named export ' + name + '.' });
+      } else if (!table.namedExports.has(name) && isSafeIdentifier(name)) {
+        additions.push(safePlannedExport(name, filePath));
+        repairs.push({ code: 'MISSING_PLANNED_NAMED_EXPORT', file: filePath, line: null, action: 'Created the manifest-required named export ' + name + '.' });
       }
     }
     return additions.length ? { ...file, content: String(file.content || '').replace(/\s*$/, '\n\n') + additions.join('\n') + '\n' } : file;
   });
+}
+
+function isSafeIdentifier(value) {
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(String(value || ''));
+}
+
+function safePlannedExport(name, filePath) {
+  if (/reducer$/i.test(name)) return 'export function ' + name + '(state = {}, _action = {}) { return state; }';
+  if (/^use[A-Z0-9_]/.test(name)) return 'export function ' + name + '() { return {}; }';
+  if (/^mock[A-Z0-9_]/.test(name)) return safeMockExport(name);
+  if (/^select[A-Z0-9_]/.test(name)) return safeSelectorExport(name);
+  if (/^(set|add|update|delete|remove|toggle)[A-Z0-9_]/.test(name)) return 'export function ' + name + '(payload) { return { type: "generated/' + name + '", payload }; }';
+  if (name === 'store' && /(?:^|\/)store[.]js$/.test(filePath)) return 'export const store = createAppStore();';
+  if (/^[A-Z]/.test(name) && /[.]jsx$/.test(filePath)) return 'export function ' + name + '() { return null; }';
+  return 'export function ' + name + '(...args) { return args[0] ?? null; }';
+}
+
+function safeMockExport(name) {
+  const objectLike = /(?:Settings|Config|Profile|Details|Summary)$/i.test(name);
+  return 'export function ' + name + '() { return ' + (objectLike ? '{}' : '[]') + '; }';
+}
+
+function safeSelectorExport(name) {
+  if (/(?:Filter|Settings|Config|Profile|Details)$/i.test(name)) return 'export function ' + name + '(state = {}) { return state.generated ?? {}; }';
+  if (/(?:ById|Current|Selected)$/i.test(name)) return 'export function ' + name + '() { return null; }';
+  return 'export function ' + name + '(state = {}) { return state.generated ?? []; }';
 }
 
 function repairDuplicateStatements(file, repairs) {
@@ -476,6 +576,11 @@ function bindingNames(node) {
 }
 
 function resolve(from, source, fileMap) {
-  const base = normalizeProjectPath(path.posix.join(path.posix.dirname(from), source));
+  let base;
+  try {
+    base = normalizeProjectPath(path.posix.join(path.posix.dirname(from), source));
+  } catch {
+    return null;
+  }
   return [base, base + '.js', base + '.jsx', base + '.css', base + '/index.js', base + '/index.jsx'].find((candidate) => fileMap.has(candidate));
 }

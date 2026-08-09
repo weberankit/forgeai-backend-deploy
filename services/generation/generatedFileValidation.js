@@ -116,8 +116,18 @@ function validateRelativeImports(files, pathSet, scopedPathSet = null) {
     let match;
     while ((match = importRegex.exec(file.content))) {
       const specifier = match[1];
+      if (specifier.startsWith('src/')) {
+        unresolved.push(file.path + ': ' + specifier + ' (internal source imports must be relative)');
+        continue;
+      }
       if (!specifier.startsWith('.')) continue;
-      const base = normalizeProjectPath(path.posix.join(dir, specifier));
+      let base;
+      try {
+        base = normalizeProjectPath(path.posix.join(dir, specifier));
+      } catch {
+        unresolved.push(file.path + ': ' + specifier + ' (relative import escapes the generated src directory)');
+        continue;
+      }
       const candidates = [base, base + '.js', base + '.jsx', base + '.css', path.posix.join(base, 'index.js'), path.posix.join(base, 'index.jsx')];
       if (!candidates.some((candidate) => pathSet.has(candidate))) {
         unresolved.push(file.path + ': ' + specifier);

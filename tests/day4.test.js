@@ -6,7 +6,7 @@ import { buildAgentExecutionStages, buildGenerationBatches } from '../services/g
 import { validateGeneratedFiles, validateGenerationBatch } from '../services/generation/generatedFileValidation.js';
 import { runSmokeRenderTests } from '../services/review/testingAgent.js';
 import { runQualityReview } from '../services/review/reviewAgent.js';
-import { generateProjectFiles, repairGenerationBatch } from '../services/generation/codeGenerationService.js';
+import { generateProjectFiles, repairGenerationBatch, selectOwnedBatchFiles } from '../services/generation/codeGenerationService.js';
 import { applyNaturalLanguageEdit } from '../services/edit/editAgent.js';
 import { explainProjectQuestion } from '../services/explain/explainAgent.js';
 import { buildDependencyGraph } from '../services/review/dependencyGraph.js';
@@ -20,6 +20,22 @@ import { appendVerifiedFixMemoryRecord, buildErrorSignature, buildKnownPitfallsP
 test('rejects unsafe generated paths', () => {
   assert.throws(() => normalizeProjectPath('../secret.js'));
   assert.equal(normalizeProjectPath('src/App.jsx'), 'src/App.jsx');
+});
+
+test('batch ownership filtering ignores malformed and unowned model paths', () => {
+  const selected = selectOwnedBatchFiles([
+    { path: 'src/store/slices/filterSlice.js', content: 'export const ok = true;' },
+    { path: 'store/slices/filterSlice', content: 'invalid path' },
+    { path: 'src/other.js', content: 'unowned path' },
+    { path: 'src/store/slices/filterSlice.js', content: 'export const latest = true;' }
+  ], { files: ['src/store/slices/filterSlice.js'] });
+
+  assert.deepEqual(selected.files, [
+    { path: 'src/store/slices/filterSlice.js', content: 'export const latest = true;' }
+  ]);
+  assert.ok(selected.rejectedPaths.includes('store/slices/filterSlice'));
+  assert.ok(selected.rejectedPaths.includes('src/other.js'));
+  assert.ok(selected.rejectedPaths.includes('src/store/slices/filterSlice.js (duplicate)'));
 });
 
 test('topologically sorts blueprint files', () => {
@@ -305,6 +321,27 @@ test('repairs missing relative route imports before final generation validation'
   ]);
   assert.ok(files.some((file) => file.path === 'src/routes/AppRoutes.jsx'));
   assert.doesNotThrow(() => validateGeneratedFiles(files));
+});
+
+test('repairs invalid source-root imports instead of treating src as a package', () => {
+  const files = repairMissingRelativeImports([
+    { path: 'src/components/shared/Header.jsx', language: 'jsx', content: 'export default function Header(){ return <header /> }' },
+    { path: 'src/pages/Home.jsx', language: 'jsx', content: 'import Header from "src/components/shared/Header.jsx"; export default function Home(){ return <Header /> }' }
+  ]);
+  const home = files.find((file) => file.path === 'src/pages/Home.jsx');
+  assert.match(home.content, /from "\.\.\/components\/shared\/Header"/);
+  assert.doesNotMatch(home.content, /from "src\//);
+});
+
+test('generation validation rejects an uncorrected source-root import', () => {
+  const files = [
+    { path: 'package.json', language: 'json', content: JSON.stringify({ scripts: { dev: 'vite' }, dependencies: { react: '^18.3.1' } }) },
+    { path: 'index.html', language: 'html', content: '<div id="root"></div>' },
+    { path: 'src/main.jsx', language: 'jsx', content: "import App from './App.jsx';" },
+    { path: 'src/App.jsx', language: 'jsx', content: 'import Header from "src/components/Header.jsx"; export default function App(){ return <Header /> }' },
+    { path: 'src/components/Header.jsx', language: 'jsx', content: 'export default function Header(){ return <header /> }' }
+  ];
+  assert.throws(() => validateGeneratedFiles(files), /internal source imports must be relative/);
 });
 
 test('keeps dependency graph synced after generation', async () => {

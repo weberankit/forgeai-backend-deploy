@@ -92,6 +92,25 @@ test('runtime repair fixes an existing invalid tailwind-merge import without an 
   assert.match(project.generatedFiles.find((file) => file.path === 'src/components/ui/DataTable.jsx').content, /twMerge as tailwindMerge/);
 });
 
+test('runtime repair corrects every source-root import in one deterministic attempt', async () => {
+  const project = validProject();
+  project.generatedFiles.push(
+    { path: 'src/components/Header.jsx', language: 'jsx', content: 'export default function Header(){ return <header /> }' },
+    { path: 'src/pages/Home.jsx', language: 'jsx', content: 'import Header from "src/components/Header.jsx"; export default function Home(){ return <Header /> }' },
+    { path: 'src/pages/Journal.jsx', language: 'jsx', content: 'import Header from "src/components/Header.jsx"; export default function Journal(){ return <Header /> }' }
+  );
+  const result = await runFixLoop(project, {
+    runtimeOutput: 'Vite failed to resolve import src/components/Header.jsx from src/pages/Home.jsx',
+    runtimeEvidence: { errorType: 'build', source: '/src/pages/Home.jsx' },
+    maxAttempts: 2
+  });
+
+  assert.equal(result.status, 'verification_required');
+  assert.deepEqual(new Set(result.appliedChanges), new Set(['src/pages/Home.jsx', 'src/pages/Journal.jsx']));
+  assert.match(project.generatedFiles.find((file) => file.path === 'src/pages/Home.jsx').content, /from "\.\.\/components\/Header"/);
+  assert.match(project.generatedFiles.find((file) => file.path === 'src/pages/Journal.jsx').content, /from "\.\.\/components\/Header"/);
+});
+
 test('runtime repair preserves Mongoose subdocument fields while cloning and validating files', async () => {
   const project = validProject();
   project.generatedFiles.push({

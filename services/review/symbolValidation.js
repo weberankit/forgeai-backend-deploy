@@ -132,7 +132,12 @@ function validateKnownPackageImports(filePath, imported, findings) {
 }
 
 function resolveImport(from, source, fileMap) {
-  const base = normalizeProjectPath(path.posix.join(path.posix.dirname(from), source));
+  let base;
+  try {
+    base = normalizeProjectPath(path.posix.join(path.posix.dirname(from), source));
+  } catch {
+    return null;
+  }
   return extensions.map((suffix) => base + suffix).find((candidate) => fileMap.has(candidate)) || null;
 }
 

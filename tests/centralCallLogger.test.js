@@ -37,9 +37,8 @@ test('Langfuse usage normalization records counts without request content', () =
     input: 'must not be copied',
     output: 'must not be copied'
   }), {
-    promptTokens: 120,
-    completionTokens: 45,
-    totalTokens: 165
+    input: 120,
+    output: 45
   });
   assert.deepEqual(normalizeOpenAiUsage(null), {});
 });

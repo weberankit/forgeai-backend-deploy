@@ -3,7 +3,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { withLangfuseObservation, withLangfuseProjectContext } from './langfuseTracing.js';
+import { normalizeOpenAiUsage, withLangfuseObservation, withLangfuseProjectContext } from './langfuseTracing.js';
 
 const serviceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_LOG_PATH = path.resolve(serviceDirectory, '..', '..', 'logs', 'ai-agent-calls.jsonl');
@@ -46,19 +46,32 @@ export async function withCallLog({ type, operation, provider, model, parentCall
   const callId = randomUUID();
   const inheritedContext = callContext.getStore() || {};
   parentCallId ||= inheritedContext.callId;
+  const effectiveMetadata = inheritedContext.projectId && !metadata?.projectId
+    ? { ...(metadata || {}), projectId: inheritedContext.projectId }
+    : metadata;
+  let recordedUsage = {};
   const startedAt = new Date();
-  await writeCallEvent({ timestamp: startedAt.toISOString(), event: 'started', type, callId, parentCallId, operation, provider, model, metadata });
+  await writeCallEvent({ timestamp: startedAt.toISOString(), event: 'started', type, callId, parentCallId, operation, provider, model, metadata: effectiveMetadata });
   try {
     const result = await withLangfuseObservation({
-      type, operation, provider, model, metadata: sanitize(metadata), input
-    }, (telemetry) => callContext.run(
-      { ...inheritedContext, callId },
-      () => callback({ callId, ...telemetry })
-    ));
-    await writeCallEvent({ timestamp: new Date().toISOString(), event: 'completed', type, callId, parentCallId, operation, provider, model, durationMs: Date.now() - startedAt.getTime(), metadata });
+      type, operation, provider, model, metadata: sanitize(effectiveMetadata), input
+    }, (telemetry) => {
+      const localTelemetry = {
+        ...telemetry,
+        recordUsage(usage) {
+          recordedUsage = { ...recordedUsage, ...normalizeOpenAiUsage(usage) };
+          telemetry.recordUsage(usage);
+        }
+      };
+      return callContext.run(
+        { ...inheritedContext, callId },
+        () => callback({ callId, ...localTelemetry })
+      );
+    });
+    await writeCallEvent({ timestamp: new Date().toISOString(), event: 'completed', type, callId, parentCallId, operation, provider, model, durationMs: Date.now() - startedAt.getTime(), usage: recordedUsage, metadata: effectiveMetadata });
     return result;
   } catch (error) {
-    await writeCallEvent({ timestamp: new Date().toISOString(), event: 'failed', type, callId, parentCallId, operation, provider, model, durationMs: Date.now() - startedAt.getTime(), error: { name: error?.name || 'Error', message: error?.message || String(error) }, metadata });
+    await writeCallEvent({ timestamp: new Date().toISOString(), event: 'failed', type, callId, parentCallId, operation, provider, model, durationMs: Date.now() - startedAt.getTime(), usage: recordedUsage, error: { name: error?.name || 'Error', message: error?.message || String(error) }, metadata: effectiveMetadata });
     throw error;
   }
 }

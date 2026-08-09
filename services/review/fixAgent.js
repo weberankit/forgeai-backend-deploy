@@ -203,6 +203,8 @@ function previousFailedRepair(project) {
 export async function produceFixes(project, review, attempt = 1, previousAttempt = null) {
   const knownFix = produceKnownPackageFixes(project, review, attempt);
   if (knownFix.changes.length) return knownFix;
+  const internalImportFix = produceInternalSourceImportFixes(project, review, attempt);
+  if (internalImportFix.changes.length) return internalImportFix;
   const llmFix = await produceDynamicLlmFixes(project, review, attempt, previousAttempt).catch((error) => {
     if (isOpenAiCredentialError(error)) throw error;
     return null;
@@ -224,6 +226,30 @@ export async function produceFixes(project, review, attempt = 1, previousAttempt
     }
   }
   return { changes: dedupe(changes), verificationSteps: ['Run static validation', 'Refresh preview'], resolvedFindingIds: changes.flatMap((change) => change.addressesFindingIds), unresolvedIssues: [], requiresFullReview: true };
+}
+
+function produceInternalSourceImportFixes(project, review, attempt) {
+  const files = toPlainGeneratedFiles(project.generatedFiles || []);
+  const repairedFiles = repairMissingRelativeImports(files);
+  const current = new Map(files.map((file) => [normalizeProjectPath(file.path), String(file.content || '')]));
+  const findingIds = (review.findings || []).filter((finding) => ['blocker', 'high'].includes(finding.severity)).map((finding) => finding.id);
+  const changes = repairedFiles
+    .filter((file) => current.has(normalizeProjectPath(file.path)) && current.get(normalizeProjectPath(file.path)) !== String(file.content || ''))
+    .map((file) => ({
+      path: normalizeProjectPath(file.path),
+      changeType: 'update',
+      content: String(file.content || ''),
+      language: file.language || languageForPath(file.path),
+      reason: 'Deterministic runtime repair attempt ' + attempt + ': convert an invalid src/ import into a resolvable relative import.',
+      addressesFindingIds: findingIds
+    }));
+  return {
+    changes: dedupe(changes),
+    verificationSteps: ['Run static validation', 'Refresh WebContainer preview'],
+    resolvedFindingIds: findingIds,
+    unresolvedIssues: [],
+    requiresFullReview: true
+  };
 }
 
 function produceKnownPackageFixes(project, review, attempt) {

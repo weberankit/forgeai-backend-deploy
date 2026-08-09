@@ -59,7 +59,25 @@ test('Mistral transport converts structured text and vision calls to Chat Comple
     assert.equal(calls[0].body.messages[0].content[0].type, 'text');
     assert.equal(calls[0].body.messages[0].content[1].type, 'image_url');
     assert.equal(result.text, '{"ok":true}');
-    assert.deepEqual(normalizeOpenAiUsage(result.usage), { promptTokens: 12, completionTokens: 5, totalTokens: 17 });
+    assert.deepEqual(normalizeOpenAiUsage(result.usage), { input: 12, output: 5 });
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test('Mistral transport waits and retries provider rate limits before agent fallback', async () => {
+  const previousFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) return new Response(JSON.stringify({ message: 'Rate limit exceeded' }), { status: 429, headers: { 'retry-after': '0' } });
+    return Response.json({ choices: [{ message: { content: '{"ok":true}' } }] });
+  };
+  const config = { provider: 'mistral', configuredProvider: 'mistral', apiKey: testKey, baseUrl: 'https://api.mistral.test/v1', model: 'mistral-small-latest', temperature: 0.1, maxOutputTokens: 100, timeoutMs: 1000 };
+  try {
+    const response = await fetchLlmResponse(config, { input: 'Return JSON' });
+    assert.equal(response.status, 200);
+    assert.equal(calls, 2);
   } finally {
     globalThis.fetch = previousFetch;
   }
@@ -77,7 +95,7 @@ test('Mistral streaming normalizes deltas and reports usage for Langfuse', async
   const text = await readLlmStream(response, { provider: 'mistral' }, (token) => tokens.push(token), (value) => { usage = value; });
   assert.equal(text, '{"files":[]}');
   assert.deepEqual(tokens, ['{"files":', '[]}']);
-  assert.deepEqual(normalizeOpenAiUsage(usage), { promptTokens: 20, completionTokens: 4, totalTokens: 24 });
+  assert.deepEqual(normalizeOpenAiUsage(usage), { input: 20, output: 4 });
 });
 
 test('Mistral runs code generation through the existing LangGraph agent pipeline', async () => {

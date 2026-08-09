@@ -61,6 +61,7 @@ async function generateProjectFilesInternal(project, options = {}, telemetry) {
   project.currentBatch = 0;
   project.generationProgress = 2;
   project.generationError = '';
+  project.generationDiagnostics = [];
   await project.save();
 
   try {
@@ -73,8 +74,9 @@ async function generateProjectFilesInternal(project, options = {}, telemetry) {
 
     let completedBatches = 0;
     const stages = buildAgentExecutionStages(activeBatches);
+    const parallelism = generationParallelism();
     for (const stage of stages) {
-      if (stage.parallel) {
+      if (stage.parallel && parallelism > 1) {
         assertDisjointWriteSets(stage.batches);
         const stagePreviousFiles = existingFiles;
         const stageContracts = [...contracts];
@@ -84,7 +86,7 @@ async function generateProjectFilesInternal(project, options = {}, telemetry) {
         project.generationProgress = Math.max(5, Math.round((completedBatches / activeBatches.length) * 80));
         await project.save();
 
-        const results = await mapWithConcurrency(stage.batches, generationParallelism(), (batch, index) => withBatchTimeout(
+        const results = await mapWithConcurrency(stage.batches, parallelism, (batch, index) => withBatchTimeout(
           runGenerationBatch({
             project,
             batch,
@@ -110,7 +112,7 @@ async function generateProjectFilesInternal(project, options = {}, telemetry) {
             .filter(({ batch: sibBatch }) => sibBatch.batchNumber !== batch.batchNumber)
             .flatMap(({ generated: sibGenerated }) => normalizeGenerationResult(sibGenerated).files || []);
           const repairContextFiles = mergeFiles(stagePreviousFiles, siblingFiles);
-          const repairedGenerated = await repairGenerationBatch({ project, batch, generated, previousFiles: repairContextFiles, contracts, warnings, manifest });
+          const repairedGenerated = await repairGenerationBatch({ project, batch, generated, previousFiles: repairContextFiles, contracts, warnings, manifest, telemetry });
           for (const warning of repairedGenerated.warnings || []) warnings.push(warning);
           for (const contract of repairedGenerated.contracts || []) contracts.push(contract);
           repairedStageFiles.push(...(repairedGenerated.files || []));
@@ -131,6 +133,12 @@ async function generateProjectFilesInternal(project, options = {}, telemetry) {
         completedBatches += stage.batches.length;
         project.currentBatch = stage.batches.at(-1)?.batchNumber || project.currentBatch;
         await project.save();
+        recordGenerationDiagnostic(project, {
+          type: 'checkpoint_committed',
+          stage: stage.phase,
+          batches: stage.batches.map((batch) => batch.batchNumber),
+          fileCount: committed.files.length
+        });
         await options.onFiles?.(committed.changedFiles, project);
       } else {
         for (const batch of stage.batches) {
@@ -151,7 +159,7 @@ async function generateProjectFilesInternal(project, options = {}, telemetry) {
             batchLabel
           );
           const repairedGenerated = await withBatchTimeout(
-            repairGenerationBatch({ project, batch, generated, previousFiles: existingFiles, contracts, warnings, manifest }),
+            repairGenerationBatch({ project, batch, generated, previousFiles: existingFiles, contracts, warnings, manifest, telemetry }),
             batchTimeoutMs,
             batchLabel + ' repair'
           );
@@ -170,6 +178,12 @@ async function generateProjectFilesInternal(project, options = {}, telemetry) {
           lastValidProjectFiles = [...committed.files];
           project.lastValidProjectFiles = lastValidProjectFiles;
           completedBatches += 1;
+          recordGenerationDiagnostic(project, {
+            type: 'checkpoint_committed',
+            stage: stage.phase,
+            batches: [batch.batchNumber],
+            fileCount: committed.files.length
+          });
           await project.save();
           await options.onFiles?.(committed.changedFiles, project);
         }
@@ -229,13 +243,18 @@ async function generateProjectFilesInternal(project, options = {}, telemetry) {
     project.generationStatus = 'failed';
     project.failedBatch = project.currentBatch || null;
     project.generationError = error.message;
+    recordGenerationDiagnostic(project, {
+      type: 'generation_failed',
+      batchNumber: project.currentBatch || 0,
+      error: error.message
+    });
     project.generationWarnings = normalizeGenerationWarnings([...warnings, error.message]);
     await project.save();
     throw error;
   }
 }
 
-export async function repairGenerationBatch({ project, batch, generated, previousFiles, contracts, warnings, manifest = null, maxAttempts = 3 }) {
+export async function repairGenerationBatch({ project, batch, generated, previousFiles, contracts, warnings, manifest = null, maxAttempts = 3, telemetry = null }) {
   const fallback = mockGenerateBatch({ project, targetFiles: batch.files, batch });
   let candidate = normalizeGenerationResult(generated);
   let lastError = null;
@@ -254,6 +273,7 @@ export async function repairGenerationBatch({ project, batch, generated, previou
     try {
       validateGenerationBatch(candidate.files, batch.files, previousFiles, manifest);
       validateBatchGraph(candidate.files, previousFiles);
+      validateBatchSmoke(candidate.files, previousFiles);
       if (attempt > 1) {
         candidate.warnings = [
           ...(candidate.warnings || []),
@@ -263,14 +283,35 @@ export async function repairGenerationBatch({ project, batch, generated, previou
       return candidate;
     } catch (error) {
       lastError = error.message;
+      const diagnostic = {
+        type: 'batch_validation_failed',
+        batchNumber: batch.batchNumber,
+        phase: batch.phase,
+        agentName: batch.agentName,
+        attempt,
+        error: error.message
+      };
+      recordGenerationDiagnostic(project, diagnostic);
+      telemetry?.recordEvent?.('batch_validation_failed', diagnostic, 'ERROR');
       if (attempt === maxAttempts) {
-        // Last attempt failed — use the fallback to fill any missing target files rather than throwing
-        const filledCandidate = fillMissingTargetFiles(candidate, batch, fallback);
-        filledCandidate.warnings = [
-          ...(filledCandidate.warnings || []),
-          'Batch ' + batch.batchNumber + ' used fallback for missing files after ' + maxAttempts + ' repair attempts: ' + lastError
-        ];
-        return filledCandidate;
+        const deterministicFallback = runDeterministicRepairs(previousFiles, fallback.files || [], manifest);
+        const safeFallback = normalizeGenerationResult({
+          ...fallback,
+          files: deterministicFallback.files,
+          warnings: [
+            ...(fallback.warnings || []),
+            'Batch ' + batch.batchNumber + ' used the safe runnable fallback after ' + maxAttempts + ' repair attempts: ' + lastError
+          ]
+        });
+        validateGenerationBatch(safeFallback.files, batch.files, previousFiles, manifest);
+        validateBatchGraph(safeFallback.files, previousFiles);
+        validateBatchSmoke(safeFallback.files, previousFiles);
+        telemetry?.recordEvent?.('batch_safe_fallback_used', {
+          batchNumber: batch.batchNumber,
+          phase: batch.phase,
+          attempts: maxAttempts
+        }, 'WARNING');
+        return safeFallback;
       }
       const repairFallback = buildRepairFallback({ fallback, candidate, batch });
       const repair = await runGenerationRepairGraph({
@@ -325,6 +366,15 @@ function validateBatchGraph(files, previousFiles) {
   const candidatePaths = new Set((files || []).map((file) => normalizeProjectPath(file.path)));
   const validation = runStaticValidation(mergeFiles(previousFiles || [], files || []));
   const blocking = validation.errors.filter((error) => !error.file || candidatePaths.has(error.file));
+  if (blocking.length) {
+    throw new Error(blocking.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
+  }
+}
+
+function validateBatchSmoke(files, previousFiles) {
+  const candidatePaths = new Set((files || []).map((file) => normalizeProjectPath(file.path)));
+  const smoke = runSmokeRenderTests(mergeFiles(previousFiles || [], files || []));
+  const blocking = smoke.errors.filter((error) => !error.file || candidatePaths.has(error.file));
   if (blocking.length) {
     throw new Error(blocking.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
   }
@@ -425,9 +475,19 @@ function withBatchTimeout(promise, timeoutMs, label) {
 }
 
 function generationParallelism() {
-  const configured = Number(process.env.GENERATION_PARALLELISM || 3);
-  if (!Number.isFinite(configured)) return 3;
+  const configured = Number(process.env.GENERATION_PARALLELISM || 1);
+  if (!Number.isFinite(configured)) return 1;
   return Math.min(6, Math.max(1, Math.floor(configured)));
+}
+
+function recordGenerationDiagnostic(project, diagnostic) {
+  if (!project) return;
+  const entry = {
+    ...diagnostic,
+    error: diagnostic?.error ? String(diagnostic.error).slice(0, 1000) : undefined,
+    timestamp: new Date().toISOString()
+  };
+  project.generationDiagnostics = [...(project.generationDiagnostics || []), entry].slice(-100);
 }
 
 async function mapWithConcurrency(items, limit, mapper) {
@@ -452,18 +512,43 @@ function normalizeGenerationResult(result) {
   };
 }
 
+export function selectOwnedBatchFiles(returnedFiles = [], batch = {}) {
+  const assigned = new Set((batch.files || []).map(normalizeProjectPath));
+  const accepted = new Map();
+  const rejectedPaths = [];
+
+  for (const file of Array.isArray(returnedFiles) ? returnedFiles : []) {
+    let filePath;
+    try {
+      filePath = normalizeProjectPath(file?.path);
+    } catch {
+      rejectedPaths.push(String(file?.path || '<missing path>'));
+      continue;
+    }
+    if (!assigned.has(filePath)) {
+      rejectedPaths.push(filePath);
+      continue;
+    }
+    if (accepted.has(filePath)) rejectedPaths.push(filePath + ' (duplicate)');
+    accepted.set(filePath, { ...file, path: filePath });
+  }
+
+  return { files: Array.from(accepted.values()), rejectedPaths: [...new Set(rejectedPaths)] };
+}
+
 function mergeGenerationRepair(candidate, repair, batch) {
   const normalizedRepair = normalizeGenerationResult(repair);
-  const targetSet = new Set((batch.files || []).map(normalizeProjectPath));
   const map = new Map((candidate.files || []).map((file) => [normalizeProjectPath(file.path), file]));
-  for (const file of normalizedRepair.files || []) {
-    const filePath = normalizeProjectPath(file.path);
-    if (targetSet.has(filePath) || map.has(filePath)) map.set(filePath, { ...file, path: filePath });
-  }
+  const selectedRepair = selectOwnedBatchFiles(normalizedRepair.files, batch);
+  for (const file of selectedRepair.files) map.set(file.path, file);
   return {
     files: Array.from(map.values()),
     contracts: [...(candidate.contracts || []), ...(normalizedRepair.contracts || [])],
-    warnings: [...(candidate.warnings || []), ...(normalizedRepair.warnings || [])]
+    warnings: [
+      ...(candidate.warnings || []),
+      ...(normalizedRepair.warnings || []),
+      ...(selectedRepair.rejectedPaths.length ? ['Ignored invalid or unowned repair files: ' + selectedRepair.rejectedPaths.join(', ')] : [])
+    ]
   };
 }
 
@@ -519,13 +604,15 @@ async function runGenerationBatch({ project, batch, batchIndex, totalBatches, pr
     }
   });
 
-  const assigned = new Set(batch.files.map(normalizeProjectPath));
   const returnedFiles = Array.isArray(generated.files) ? generated.files : [];
 
-  // Split returned files into owned vs out-of-scope
-  const rejectedPaths = returnedFiles.map((file) => normalizeProjectPath(file.path)).filter((filePath) => !assigned.has(filePath));
-  generated.files = returnedFiles.filter((file) => assigned.has(normalizeProjectPath(file.path)));
-  if (rejectedPaths.length) generated.warnings = [...(generated.warnings || []), 'Ignored files outside this agent ownership: ' + rejectedPaths.join(', ')];
+  // Model output is untrusted. Ignore malformed, duplicate, or out-of-scope paths
+  // before path validation so one extra file cannot terminate the whole project.
+  const selected = selectOwnedBatchFiles(returnedFiles, batch);
+  generated.files = selected.files;
+  if (selected.rejectedPaths.length) {
+    generated.warnings = [...(generated.warnings || []), 'Ignored invalid or unowned batch files: ' + selected.rejectedPaths.join(', ')];
+  }
 
   // Fill any target files the LLM forgot to return with fallback content
   const generatedPathSet = new Set(generated.files.map((file) => normalizeProjectPath(file.path)));
@@ -701,7 +788,7 @@ function genericLayout(filePath) {
 }
 
 function storeFile(filePath) {
-  if (filePath.endsWith('store.js')) return "export const initialAppState = {};\nexport function createAppStore() {\n  return { getState: () => initialAppState };\n}\n";
+  if (filePath.endsWith('store.js')) return "export const initialAppState = {};\nexport function createAppStore() {\n  let state = initialAppState;\n  const listeners = new Set();\n  return {\n    getState: () => state,\n    dispatch: (action) => { for (const listener of listeners) listener(); return action; },\n    subscribe: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },\n    replaceReducer: () => {}\n  };\n}\nexport const store = createAppStore();\n";
   return "export const initialState = {};\nexport function reducer(state = initialState) {\n  return state;\n}\n";
 }
 

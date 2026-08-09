@@ -8,7 +8,7 @@ import { runStaticValidation } from '../review/staticValidation.js';
 import { runEditGraph } from '../ai/langGraphAgent.js';
 import { isOpenAiCredentialError } from '../ai/openAiErrors.js';
 import { buildKnownPitfallsPrompt, retrieveVerifiedFixes } from '../memory/verifiedFixMemory.js';
-import { validateMinimalEditChanges } from './editChangeValidator.js';
+import { createExactTextChanges, validateMinimalEditChanges } from './editChangeValidator.js';
 import { withProjectCallLog } from '../observability/centralCallLogger.js';
 
 export async function applyNaturalLanguageEdit(project, message) {
@@ -47,7 +47,34 @@ async function applyNaturalLanguageEditInternal(project, message, telemetry) {
   let changes = [];
   let validation = null;
   let validationFeedback = '';
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
+  let lastValidationError = '';
+  const editableTargets = targeting.editableTargets || targeting.targets || [];
+  const exactText = createExactTextChanges(
+    (project.generatedFiles || []).filter((file) => editableTargets.includes(file.path)),
+    request.effectiveMessage
+  );
+  if (exactText.handled && !exactText.changes.length) {
+    const result = await saveClarification(project, {
+      question: exactText.clarification,
+      originalRequest: request.originalRequest,
+      latestAnswer: request.latestAnswer,
+      reason: 'exact_text_not_unique',
+      targets: targeting.targets
+    });
+    telemetry.recordOutcome('needs_clarification', { reason: result.reason });
+    return result;
+  }
+  if (exactText.changes.length) {
+    editResult = { changes: exactText.changes, warnings: [] };
+    changes = validateEditOperations(project.generatedFiles || [], exactText.changes, editableTargets, request.effectiveMessage);
+    const minimal = validateMinimalEditChanges(project.generatedFiles || [], changes, request.effectiveMessage);
+    if (!minimal.valid) throw new Error(minimal.errors.join('; '));
+    const proposedFiles = applyEditOperationsToFiles(project.generatedFiles || [], changes, 'validation-preview');
+    validation = runStaticValidation(proposedFiles);
+    if (!validation.passed) throw new Error(validation.errors.map((error) => (error.file ? error.file + ': ' : '') + error.message).join('; '));
+    telemetry.recordEvent('deterministic_exact_text_edit', { files: changes.map((change) => change.path) });
+  }
+  for (let attempt = 1; attempt <= 2 && !changes.length; attempt += 1) {
     editResult = await produceEditChanges(project, request.effectiveMessage, targeting, validationFeedback);
     const verifiedUnexpected = (editResult.rejectedChanges || []).filter((change) => canApproveUnexpectedTarget(project, targeting, change.path));
     if (verifiedUnexpected.length) {
@@ -73,7 +100,8 @@ async function applyNaturalLanguageEditInternal(project, message, telemetry) {
       break;
     } catch (error) {
       changes = [];
-      validationFeedback = 'Previous edit failed validation: ' + String(error.message || error).slice(0, 4_000) + '. Return a smaller corrected patch that preserves existing imports, exports, routes, and behavior.';
+      lastValidationError = String(error.message || error).slice(0, 4_000);
+      validationFeedback = 'Previous edit failed validation: ' + lastValidationError + '. Return a smaller corrected patch that preserves existing imports, exports, routes, and behavior.';
       telemetry.recordEvent('edit_validation_failed', { attempt, message: String(error.message || error).slice(0, 500) }, 'ERROR');
     }
   }
@@ -83,7 +111,8 @@ async function applyNaturalLanguageEditInternal(project, message, telemetry) {
       originalRequest: request.originalRequest,
       latestAnswer: request.latestAnswer,
       reason: editResult.changes.length ? 'edit_validation_failed' : 'edit_generation_failed',
-      targets: targeting.targets
+      targets: targeting.targets,
+      failureDetail: lastValidationError
     });
     telemetry.recordOutcome('needs_clarification', { reason: result.reason }, 'ERROR');
     return result;
@@ -179,7 +208,7 @@ async function produceEditChanges(project, message, targeting, validationFeedbac
   return { changes, rejectedChanges, warnings: result.warnings || [] };
 }
 
-function boundEditFiles(files, budget = 26_000) {
+function boundEditFiles(files, budget = 12_000) {
   let remaining = budget;
   return files.map((file) => {
     const content = String(file.content || '').slice(0, Math.max(0, remaining));
@@ -268,7 +297,7 @@ function failedEditClarification(targeting) {
     : 'I could not safely apply that edit. Please tell me which page or component to change and describe the specific result you want.';
 }
 
-async function saveClarification(project, { question, originalRequest, latestAnswer = '', reason, targets = [] }) {
+async function saveClarification(project, { question, originalRequest, latestAnswer = '', reason, targets = [], failureDetail = '' }) {
   project.operationStatus = 'needs_clarification';
   project.pendingEditClarification = {
     originalRequest,
@@ -276,8 +305,9 @@ async function saveClarification(project, { question, originalRequest, latestAns
     question,
     reason,
     targets,
+    failureDetail: String(failureDetail || '').slice(0, 2_000),
     createdAt: new Date().toISOString()
   };
   await project.save();
-  return { status: 'needs_clarification', clarification: question, reason, targets, warnings: [] };
+  return { status: 'needs_clarification', clarification: question, reason, targets, failureDetail: String(failureDetail || '').slice(0, 2_000), warnings: [] };
 }

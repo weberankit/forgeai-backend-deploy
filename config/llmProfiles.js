@@ -25,22 +25,75 @@ const OPENAI_MODELS = Object.freeze({
   })
 });
 
+const MISTRAL_MODELS = Object.freeze({
+  expansion: 'mistral-small-latest',
+  planning: 'mistral-large-latest',
+  generation_repair: 'mistral-large-latest',
+  edit: 'mistral-small-latest',
+  explain: 'mistral-small-latest',
+  vision: 'mistral-small-latest',
+  intent: 'mistral-small-latest',
+  phases: Object.freeze({
+    project_setup: 'mistral-small-latest',
+    component_registry: 'mistral-large-latest',
+    layout_and_routing: 'mistral-large-latest',
+    pages_and_features: 'mistral-large-latest',
+    styling_system: 'mistral-large-latest',
+    integration: 'mistral-large-latest'
+  }),
+  deep: Object.freeze({
+    planning: 'mistral-large-latest',
+    layout_and_routing: 'mistral-large-latest',
+    pages_and_features: 'mistral-large-latest',
+    styling_system: 'mistral-large-latest'
+  })
+});
+
+
 // const MISTRAL_MODELS = Object.freeze({
-//   expansion: 'mistral-small-latest',
-//   planning: 'mistral-large-latest',
-//   generation_repair: 'mistral-large-latest',
-//   edit: 'mistral-large-latest',
-//   explain: 'mistral-small-latest',
+//   expansion: 'ministral-3b-latest',
+//   planning: 'ministral-8b-latest',
+//   generation_repair: 'ministral-8b-latest',
+//   edit: 'ministral-8b-latest',
+//   explain: 'ministral-3b-latest',
 //   vision: 'mistral-small-latest',
-//   intent: 'mistral-small-latest',
+//   intent: 'ministral-3b-latest',
+
 //   phases: Object.freeze({
-//     project_setup: 'mistral-small-latest',
-//     component_registry: 'mistral-large-latest',
-//     layout_and_routing: 'mistral-large-latest',
-//     pages_and_features: 'mistral-large-latest',
-//     styling_system: 'mistral-large-latest',
-//     integration: 'mistral-small-latest'
+//     project_setup: 'ministral-3b-latest',
+//     component_registry: 'ministral-8b-latest',
+//     layout_and_routing: 'ministral-8b-latest',
+//     pages_and_features: 'ministral-8b-latest',
+//     styling_system: 'ministral-8b-latest',
+//     integration: 'ministral-3b-latest'
 //   }),
+
+//   deep: Object.freeze({
+//     planning: 'mistral-small-latest',
+//     layout_and_routing: 'mistral-small-latest',
+//     pages_and_features: 'mistral-small-latest',
+//     styling_system: 'mistral-small-latest'
+//   })
+// });
+
+// const MISTRAL_MODELS = Object.freeze({
+//   expansion: 'ministral-3b-latest',
+//   planning: 'ministral-8b-latest',
+//   generation_repair: 'ministral-8b-latest',
+//   edit: 'ministral-8b-latest',
+//   explain: 'ministral-3b-latest',
+//   vision: 'mistral-small-latest',
+//   intent: 'ministral-3b-latest',
+
+//   phases: Object.freeze({
+//     project_setup: 'ministral-3b-latest',
+//     component_registry: 'ministral-8b-latest',
+//     layout_and_routing: 'ministral-8b-latest',
+//     pages_and_features: 'ministral-8b-latest',
+//     styling_system: 'ministral-8b-latest',
+//     integration: 'ministral-3b-latest'
+//   }),
+
 //   deep: Object.freeze({
 //     planning: 'mistral-large-latest',
 //     layout_and_routing: 'mistral-large-latest',
@@ -49,32 +102,6 @@ const OPENAI_MODELS = Object.freeze({
 //   })
 // });
 
-
-const MISTRAL_MODELS = Object.freeze({
-  expansion: 'ministral-3b-latest',
-  planning: 'ministral-8b-latest',
-  generation_repair: 'ministral-8b-latest',
-  edit: 'ministral-8b-latest',
-  explain: 'ministral-3b-latest',
-  vision: 'mistral-small-latest',
-  intent: 'ministral-3b-latest',
-
-  phases: Object.freeze({
-    project_setup: 'ministral-3b-latest',
-    component_registry: 'ministral-8b-latest',
-    layout_and_routing: 'ministral-8b-latest',
-    pages_and_features: 'ministral-8b-latest',
-    styling_system: 'ministral-8b-latest',
-    integration: 'ministral-3b-latest'
-  }),
-
-  deep: Object.freeze({
-    planning: 'mistral-small-latest',
-    layout_and_routing: 'mistral-small-latest',
-    pages_and_features: 'mistral-small-latest',
-    styling_system: 'mistral-small-latest'
-  })
-});
 export const PROVIDER_MODELS = Object.freeze({
   openai: OPENAI_MODELS,
   mistral: MISTRAL_MODELS
@@ -117,7 +144,10 @@ function buildQualityProfiles(provider, models) {
       provider
     ),
     generation_repair: profile('Repair invalid or incomplete generated files', models.generation_repair, undefined, 16000, provider),
-    edit: profile('Apply requested edits to generated files', models.edit, undefined, 12000, provider),
+    edit: Object.freeze({
+      ...profile('Apply requested edits to generated files', models.edit, undefined, 6000, provider),
+      timeoutMs: 60000
+    }),
     explain: profile('Explain the generated application and code flow', models.explain, 0.3, 6000, provider),
     vision: profile('Analyze an uploaded UI reference image', models.vision, 0.2, 4000, provider),
     intent: profile('Classify a chat message into edit/explain/build', models.intent, 0, 300, provider)

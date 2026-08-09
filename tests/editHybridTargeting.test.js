@@ -2,11 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { runWithRequestLlmContext } from '../context/requestLlmContext.js';
 import { applyEditVerification, applyNaturalLanguageEdit } from '../services/edit/editAgent.js';
+import { validateMinimalEditChanges } from '../services/edit/editChangeValidator.js';
 import { buildEditInteractionIndex, rankInteractionTargets } from '../services/edit/editInteractionIndex.js';
 import { resolveEditTargets } from '../services/edit/editTargeting.js';
 import { selectSemanticEditTargets } from '../services/edit/intentRouter.js';
 import { buildDependencyGraph } from '../services/review/dependencyGraph.js';
-import { boundAgentPrompt, MAX_EDIT_PROMPT_CHARS } from '../services/ai/langGraphAgent.js';
+import { boundAgentPrompt, MAX_EDIT_PROMPT_CHARS, MAX_EDIT_RETRY_PROMPT_CHARS } from '../services/ai/langGraphAgent.js';
 
 const apiKey = 'sk-test-' + 'h'.repeat(32);
 
@@ -111,6 +112,21 @@ test('invalid edit output is retried with validation feedback before anything is
   } finally { mock.restore(); }
 });
 
+test('an exact text replacement bypasses whole-file LLM regeneration', async () => {
+  const value = project();
+  const mock = mockProvider(() => ({
+    understanding: 'Replace exact link text', scope: 'focused', clarity: 'clear', needsClarification: false,
+    targets: ['src/pages/Home.jsx'], confidence: 'high'
+  }));
+  try {
+    const result = await runWithRequestLlmContext({ openAiApiKey: apiKey }, () => applyNaturalLanguageEdit(value, "Replace 'Explore Gallery' with 'Ankit'"));
+    assert.equal(result.status, 'edit_verification_pending');
+    assert.deepEqual(result.changes.map((change) => change.path), ['src/pages/Home.jsx']);
+    assert.match(value.generatedFiles.find((file) => file.path === 'src/pages/Home.jsx').content, />Ankit</);
+    assert.equal(mock.inputs.length, 1);
+  } finally { mock.restore(); }
+});
+
 test('failed browser verification restores the snapshot instead of keeping an invalid edit', () => {
   const value = project();
   const original = value.generatedFiles.map((file) => ({ ...file }));
@@ -129,4 +145,59 @@ test('complete edit prompts are capped after assembly', () => {
   const prompt = boundAgentPrompt('edit', 'x'.repeat(90_000));
   assert.equal(prompt.length, MAX_EDIT_PROMPT_CHARS);
   assert.match(prompt, /Optional trailing context removed/);
+});
+
+test('edit retries use a smaller context budget after a provider or validation failure', () => {
+  const prompt = boundAgentPrompt('edit', 'x'.repeat(90_000), MAX_EDIT_RETRY_PROMPT_CHARS);
+  assert.equal(prompt.length, MAX_EDIT_RETRY_PROMPT_CHARS);
+  assert.ok(prompt.length < MAX_EDIT_PROMPT_CHARS);
+});
+
+test('behavior repairs allow a substantial valid component update within a bounded size', () => {
+  const rows = Array.from({ length: 100 }, (_, index) => 'const row' + index + ' = ' + index + ';');
+  const before = rows.join('\n');
+  const after = [...rows.slice(0, 50), ...Array.from({ length: 70 }, (_, index) => 'const updatedRow' + index + ' = ' + index + ';')].join('\n');
+  const result = validateMinimalEditChanges(
+    [{ path: 'src/pages/Dashboard.jsx', content: before }],
+    [{ path: 'src/pages/Dashboard.jsx', operation: 'update', content: after }],
+    'Fix the dashboard data interaction behavior'
+  );
+  assert.equal(result.valid, true);
+});
+
+test('behavior repair allowance accepts a bounded complete-file rewrite', () => {
+  const unchanged = Array.from({ length: 20 }, (_, index) => 'const stable' + index + ' = ' + index + ';');
+  const before = [...unchanged, ...Array.from({ length: 80 }, (_, index) => 'const old' + index + ' = ' + index + ';')].join('\n');
+  const after = [...unchanged, ...Array.from({ length: 80 }, (_, index) => 'const fixed' + index + ' = ' + index + ';')].join('\n');
+  const result = validateMinimalEditChanges(
+    [{ path: 'src/pages/Dashboard.jsx', content: before }],
+    [{ path: 'src/pages/Dashboard.jsx', operation: 'update', content: after }],
+    'Fix the dashboard interaction behavior'
+  );
+  assert.equal(result.valid, true, result.errors.join('; '));
+});
+
+test('navigation repair rejects a cosmetic active state with no content or routing connection', () => {
+  const original = [{ path: 'src/components/Sidebar.jsx', content: 'export function Sidebar(){ return <button>Dashboard</button>; }' }];
+  const cosmetic = [{ path: 'src/components/Sidebar.jsx', operation: 'update', content: 'export function Sidebar(){ const active = true; return <button className={active ? "active" : ""}>Dashboard</button>; }' }];
+  const functional = [
+    { path: 'src/components/Sidebar.jsx', operation: 'update', content: 'export function Sidebar({ onSelect }){ return <button onClick={() => onSelect("dashboard")}>Dashboard</button>; }' },
+    { path: 'src/App.jsx', operation: 'update', content: 'export function App(){ const selectedView = "dashboard"; return selectedView === "dashboard" ? <main>Dashboard</main> : <main>Other</main>; }' }
+  ];
+  const functionalOriginal = [...original, { path: 'src/App.jsx', content: 'export function App(){ return <main>Dashboard</main>; }' }];
+  assert.equal(validateMinimalEditChanges(original, cosmetic, 'Fix navbar tabs not working').valid, false);
+  assert.equal(validateMinimalEditChanges(functionalOriginal, functional, 'Fix navbar tabs not working').valid, true);
+});
+
+test('mixed label and navigation repair is not rejected as a text-only edit', () => {
+  const original = [
+    { path: 'src/pages/Dashboard.jsx', content: 'export default function Dashboard(){ return <main className="old"><h1>Dashboard</h1></main>; }' },
+    { path: 'src/components/NavigationTabs.jsx', content: 'export default function NavigationTabs(){ return <button>Dashboard</button>; }' }
+  ];
+  const proposed = [
+    { path: 'src/pages/Dashboard.jsx', operation: 'update', content: 'export default function Dashboard(){ return <main className="new"><h1>Dashboard</h1><strong>Ankit</strong></main>; }' },
+    { path: 'src/components/NavigationTabs.jsx', operation: 'update', content: "import { NavLink } from 'react-router-dom'; export default function NavigationTabs(){ return <NavLink className=\"tab\" to=\"/\">Dashboard</NavLink>; }" }
+  ];
+  const result = validateMinimalEditChanges(original, proposed, "Add a visible label 'Ankit' and fix the navbar tabs so every tab navigates to its page");
+  assert.equal(result.valid, true, result.errors.join('; '));
 });

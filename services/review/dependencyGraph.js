@@ -68,7 +68,10 @@ function analyzeFile(filePath, content, fileMap) {
     ImportDeclaration(pathRef) {
       const source = pathRef.node.source.value;
       const symbols = pathRef.node.specifiers.map((specifier) => specifier.local?.name).filter(Boolean);
-      if (source.startsWith('.')) {
+      if (source.startsWith('src/')) {
+        node.missingImports = node.missingImports || [];
+        node.missingImports.push(source + ' (internal source imports must be relative)');
+      } else if (source.startsWith('.')) {
         const resolved = resolveRelativeImport(filePath, source, fileMap);
         if (resolved) {
           node.imports.push(resolved);
@@ -120,7 +123,12 @@ function analyzeFile(filePath, content, fileMap) {
 }
 
 function resolveRelativeImport(fromPath, specifier, fileMap) {
-  const base = normalizeProjectPath(path.posix.join(path.posix.dirname(fromPath), specifier));
+  let base;
+  try {
+    base = normalizeProjectPath(path.posix.join(path.posix.dirname(fromPath), specifier));
+  } catch {
+    return null;
+  }
   const candidates = [base, base + '.js', base + '.jsx', base + '.css', path.posix.join(base, 'index.js'), path.posix.join(base, 'index.jsx')];
   return candidates.find((candidate) => fileMap.has(candidate)) || null;
 }

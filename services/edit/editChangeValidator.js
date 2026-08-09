@@ -40,21 +40,66 @@ export function validateMinimalEditChanges(originalFiles, proposedChanges, messa
   const words = new Set(String(message || '').toLowerCase().match(/[a-z]+/g) || []);
   const contains = (values) => values.some((value) => words.has(value));
   const broadRequest = contains(['redesign', 'rewrite', 'rebuild', 'entire', 'whole', 'all', 'every', 'theme', 'layout']);
-  const textOnly = contains(['text', 'copy', 'word', 'label', 'title', 'heading', 'rename', 'replace']) && !contains(['color', 'background', 'style', 'spacing', 'layout', 'font', 'size']);
+  const behaviorRepair = contains(['fix', 'working', 'navigate', 'navigation', 'tab', 'tabs', 'click', 'clickable', 'interaction', 'behavior']);
+  const textOnly = contains(['text', 'copy', 'word', 'label', 'title', 'heading', 'rename', 'replace'])
+    && !behaviorRepair
+    && !broadRequest
+    && !contains(['color', 'background', 'style', 'spacing', 'layout', 'font', 'size']);
   const errors = [];
+  const meaningfulChanges = [];
   for (const change of proposedChanges || []) {
     if (change.operation === 'delete') continue;
     const before = byPath.get(change.path);
     const after = String(change.content || '');
     if (before === undefined || before === after) continue;
+    meaningfulChanges.push({ path: change.path, before, after });
     const stats = lineDiffStats(before, after);
-    const allowed = broadRequest ? Math.max(30, Math.ceil(stats.beforeLines * 0.75)) : Math.max(12, Math.ceil(stats.beforeLines * 0.35));
+    const allowed = behaviorRepair
+      ? Math.max(50, Math.ceil(stats.beforeLines * 1.75))
+      : broadRequest
+        ? Math.max(30, Math.ceil(stats.beforeLines * 0.75))
+        : Math.max(12, Math.ceil(stats.beforeLines * 0.35));
     if (stats.changed > allowed) errors.push(change.path + ' changes ' + stats.changed + ' lines; the safe limit is ' + allowed + '.');
     if (!contains(['remove', 'delete']) && after.length < before.length * 0.6) errors.push(change.path + ' removes too much existing code.');
     if (textOnly && classNames(before).join('\n') !== classNames(after).join('\n')) errors.push(change.path + ' changes styling classes during a text-only edit.');
     if (textOnly && changedValueCount(uiTextValues(before), uiTextValues(after)) > 2) errors.push(change.path + ' changes neighboring UI text beyond the requested replacement.');
   }
+  const navigationRepair = behaviorRepair && contains(['nav', 'navbar', 'navigation', 'tab', 'tabs']);
+  if (navigationRepair && !meaningfulChanges.some(hasNavigationBehaviorChange)) {
+    errors.push('The request asks to repair navigation, but the patch does not connect a tab to routing, a parent selection callback, or content-view state.');
+  }
+  if (navigationRepair && !hasNavigationDestination(meaningfulChanges)) {
+    errors.push('The navigation patch does not change a route or conditionally render content for the selected tab.');
+  }
   return { valid: errors.length === 0, errors };
+}
+
+function hasNavigationDestination(changes) {
+  const changedContent = changes.map((change) => change.after).join('\n');
+  return /<(?:NavLink|Link)\b|\buseNavigate\b|\bnavigate\s*\(/.test(changedContent)
+    || /\b(?:active|selected|current)(?:Tab|View|Section)\s*===/.test(changedContent)
+    || /switch\s*\(\s*(?:active|selected|current)(?:Tab|View|Section)\s*\)/.test(changedContent)
+    || /\[(?:active|selected|current)(?:Tab|View|Section)\]/.test(changedContent);
+}
+
+function hasNavigationBehaviorChange(change) {
+  if (!/src\/(?:App[.]jsx|components\/[^/]*(?:Nav|Sidebar)[^/]*[.]jsx|pages\/[^/]+[.]jsx)$/i.test(change.path)) return false;
+  return navigationBehaviorSignature(change.before) !== navigationBehaviorSignature(change.after)
+    && navigationBehaviorSignature(change.after).length > 0;
+}
+
+function navigationBehaviorSignature(content) {
+  const value = String(content || '');
+  const patterns = [
+    /<(?:NavLink|Link)\b/g,
+    /\buseNavigate\b/g,
+    /\bnavigate\s*\(/g,
+    /\bon(?:Navigate|Select|TabChange|ItemChange)\b/g,
+    /\b(?:active|selected|current)(?:Tab|View|Section)\b/g,
+    /\bset(?:Active|Selected|Current)(?:Tab|View|Section)\b/g,
+    /window[.]location/g
+  ];
+  return patterns.map((pattern) => (value.match(pattern) || []).length).join(':');
 }
 
 function findSafeTextRanges(content, expected) {

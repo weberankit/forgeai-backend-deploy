@@ -31,6 +31,7 @@ export function validateEditOperations(existingFiles, proposedChanges, approvedT
       if (!current) throw new Error('Update requires an existing file: ' + path);
       if (!approved.has(path)) throw new Error('Update is outside the approved integration targets: ' + path);
       if (typeof proposed.content !== 'string' || !proposed.content.trim()) throw new Error('Updated file content is required: ' + path);
+      if (String(proposed.content) === String(current.content || '')) throw new Error('Update did not make a file change: ' + path);
     }
     if (operation === 'delete') {
       if (!explicitDelete) throw new Error('Delete requires explicit user intent.');

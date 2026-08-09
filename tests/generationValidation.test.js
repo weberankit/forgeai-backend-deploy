@@ -13,6 +13,7 @@ import { buildExpansionPrompt } from '../services/ai/prompts/expansionPrompt.js'
 import { buildPlanningPrompt } from '../services/ai/prompts/planningPrompt.js';
 import { validateBlueprint, validateExpansionSpec } from '../services/ai/parseStructuredResponse.js';
 import { sanitizePackageJson } from '../services/generation/packageSafety.js';
+import { boundAgentPrompt, MAX_CODE_GENERATION_PROMPT_CHARS } from '../services/ai/langGraphAgent.js';
 
 test('code generation prompt preserves the standard implementation workflow', () => {
   const prompt = buildCodeGenerationPrompt({
@@ -27,6 +28,54 @@ test('code generation prompt preserves the standard implementation workflow', ()
   assert.match(prompt, /only the final JSON output should be returned/);
   assert.match(prompt, /dependency list is locked/);
   assert.doesNotMatch(prompt, /You may add a browser-compatible npm dependency/);
+});
+
+test('code generation requests have a hard context budget', () => {
+  const raw = buildCodeGenerationPrompt({
+    specification: { projectName: 'budget-test', projectSummary: 'x'.repeat(20_000) },
+    blueprint: {
+      fileList: [{ path: 'src/pages/Home.jsx', responsibility: 'Home page', dependsOn: ['src/components/Header.jsx'] }],
+      routes: [{ path: '/', component: 'Home' }]
+    },
+    previousFiles: [{ path: 'src/components/Header.jsx', language: 'jsx', content: 'export default function Header() {' + 'x'.repeat(30_000) + '}' }],
+    targetFiles: ['src/pages/Home.jsx'],
+    contracts: [],
+    warnings: [],
+    dependencyContext: { manifest: { files: { 'src/pages/Home.jsx': { exports: ['default'] } } } }
+  });
+  const bounded = boundAgentPrompt('code_generation', raw);
+  assert.ok(bounded.length <= MAX_CODE_GENERATION_PROMPT_CHARS);
+  assert.match(bounded, /Target files for this checkpoint/);
+  assert.match(bounded, /src\/pages\/Home\.jsx/);
+  assert.match(bounded, /Target dependency manifest/);
+  assert.equal(boundAgentPrompt('code_generation', 'x'.repeat(100_000)).length, MAX_CODE_GENERATION_PROMPT_CHARS);
+});
+
+test('code generation context avoids duplicate manifests and fairly shares dependency content', () => {
+  const prompt = buildCodeGenerationPrompt({
+    specification: {},
+    blueprint: {
+      fileList: [
+        { path: 'src/pages/Home.jsx', dependsOn: ['src/data/first.js', 'src/data/second.js'] },
+        { path: 'src/data/first.js' },
+        { path: 'src/data/second.js' },
+        { path: 'src/pages/Unrelated.jsx', responsibility: 'must-not-be-sent' }
+      ]
+    },
+    previousFiles: [
+      { path: 'src/data/first.js', language: 'js', content: 'FIRST_' + 'a'.repeat(9_000) },
+      { path: 'src/data/second.js', language: 'js', content: 'SECOND_' + 'b'.repeat(2_000) }
+    ],
+    targetFiles: ['src/pages/Home.jsx'],
+    contracts: [],
+    warnings: [],
+    dependencyContext: { manifest: { marker: 'sentinel-manifest' }, knownPitfalls: 'sentinel-pitfall' }
+  });
+  assert.equal((prompt.match(/sentinel-manifest/g) || []).length, 1);
+  assert.equal((prompt.match(/sentinel-pitfall/g) || []).length, 1);
+  assert.match(prompt, /FIRST_/);
+  assert.match(prompt, /SECOND_/);
+  assert.doesNotMatch(prompt, /must-not-be-sent/);
 });
 
 test('expansion prompt always asks at least one useful initial clarification', () => {
@@ -117,6 +166,42 @@ test('deterministic path repair uses only one unambiguous generated target', () 
   ], null);
   assert.match(result.files.find((file) => file.path === 'src/pages/HomePage.jsx').content, /\.\.\/components\/Card/);
   assert.equal(result.validation.passed, true);
+});
+
+test('deterministic path repair recovers an import that climbs outside src', () => {
+  const result = runDeterministicRepairs([], [
+    { path: 'src/utils/animations.js', content: 'export const fadeIn = {};' },
+    { path: 'src/components/Navigation.jsx', content: "import { fadeIn } from '../../utils/animations'; export default function Navigation(){ return <nav /> }" }
+  ], null);
+  const navigation = result.files.find((file) => file.path === 'src/components/Navigation.jsx');
+  assert.match(navigation.content, /from '\.\.\/utils\/animations'/);
+  assert.doesNotThrow(() => validateGenerationBatch(result.files, ['src/utils/animations.js', 'src/components/Navigation.jsx']));
+});
+
+test('deterministic fallback exports never return null for mock collections', () => {
+  const result = runDeterministicRepairs([], [
+    { path: 'src/data/mockData.js', content: 'export function mockCustomers(...args) { return args[0] ?? null; }\nexport function mockSettings(...args) { return args[0] ?? null; }' }
+  ], null);
+  const content = result.files[0].content;
+  assert.match(content, /mockCustomers\(\) \{ return \[\]; \}/);
+  assert.match(content, /mockSettings\(\) \{ return \{\}; \}/);
+  assert.doesNotMatch(content, /args\[0\] \?\? null/);
+});
+
+test('main does not mount an app-owned provider outside the application router', () => {
+  const previous = [{
+    path: 'src/App.jsx', language: 'jsx',
+    content: "import { BrowserRouter } from 'react-router-dom'; import { ScrollProvider } from './providers/ScrollProvider.jsx'; export default function App(){ return <BrowserRouter><ScrollProvider><main>Ready</main></ScrollProvider></BrowserRouter>; }"
+  }];
+  const proposed = [{
+    path: 'src/main.jsx', language: 'jsx',
+    content: "import React from 'react';\nimport ReactDOM from 'react-dom/client';\nimport App from './App.jsx';\nimport { ScrollProvider } from './providers/ScrollProvider.jsx';\nReactDOM.createRoot(document.getElementById('root')).render(<React.StrictMode><ScrollProvider><App /></ScrollProvider></React.StrictMode>);"
+  }];
+  const result = runDeterministicRepairs(previous, proposed);
+  const main = result.files.find((file) => file.path === 'src/main.jsx');
+  assert.doesNotMatch(main.content, /ScrollProvider/);
+  assert.match(main.content, /<React[.]StrictMode><App \/><\/React[.]StrictMode>/);
+  assert.ok(result.repairs.some((repair) => repair.code === 'DUPLICATE_ROOT_PROVIDER'));
 });
 
 test('manifest gives each generated path one owner and parallel writes cannot overlap', () => {
@@ -241,6 +326,23 @@ test('manifest contract repairs and enforces a page default export before integr
   const repaired = runDeterministicRepairs([], namedOnly, manifest);
   assert.match(repaired.files[0].content, /export default LandingPage;/);
   assert.doesNotThrow(() => validateGenerationBatch(repaired.files, ['src/pages/LandingPage.jsx'], [], manifest));
+});
+
+test('deterministic fallback creates named exports required by the manifest', () => {
+  const manifest = {
+    files: {
+      'src/store/slices/metricSlice.js': { expectedExports: ['metricReducer'] },
+      'src/hooks/useTheme.js': { expectedExports: ['useTheme'] }
+    }
+  };
+  const fallback = [
+    { path: 'src/store/slices/metricSlice.js', content: 'export const initialState = {};\n' },
+    { path: 'src/hooks/useTheme.js', content: 'export const generatedModule = true;\n' }
+  ];
+  const repaired = runDeterministicRepairs([], fallback, manifest);
+  assert.match(repaired.files[0].content, /export function metricReducer\(state = \{\}/);
+  assert.match(repaired.files[1].content, /export function useTheme\(\)/);
+  assert.doesNotThrow(() => validateGenerationBatch(repaired.files, fallback.map((file) => file.path), [], manifest));
 });
 
 test('page manifest keeps default export when blueprint lists only a named export', () => {

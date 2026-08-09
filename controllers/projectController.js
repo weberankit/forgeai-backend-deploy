@@ -455,10 +455,15 @@ export async function verifyProjectRepair(req, res, next) {
 
 export async function classifyProjectMessage(req, res, next) {
   try {
-    await findVisitorProject(req.params.projectId, req.visitorId);
+    const project = await findVisitorProject(req.params.projectId, req.visitorId);
     const message = String(req.body.message || '').trim();
     if (!message) throw httpError(400, 'message is required.');
-    const intent = await routeChatIntent(message);
+    const intent = await withProjectCallLog({
+      projectId: project.projectId,
+      operation: 'project_intent',
+      qualityMode: project.qualityMode,
+      metadata: { messageLength: message.length }
+    }, () => routeChatIntent(message));
     res.json({ intent });
   } catch (error) { next(error); }
 }

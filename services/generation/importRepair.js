@@ -5,7 +5,9 @@ import { toPlainGeneratedFiles } from './generatedFileObjects.js';
 const importRegex = /import\s+(?:[^'";]+?\s+from\s+)?['"]([^'"]+)['"]/g;
 
 export function repairMissingRelativeImports(files = []) {
-  const normalized = toPlainGeneratedFiles(files);
+  let normalized = toPlainGeneratedFiles(files);
+  const originalByPath = new Map(normalized.map((file) => [file.path, file]));
+  normalized = normalized.map((file) => repairRootSourceImports(file, originalByPath));
   const byPath = new Map(normalized.map((file) => [file.path, file]));
   const additions = [];
 
@@ -17,7 +19,12 @@ export function repairMissingRelativeImports(files = []) {
     while ((match = importRegex.exec(file.content))) {
       const specifier = match[1];
       if (!specifier.startsWith('.')) continue;
-      const base = normalizeProjectPath(path.posix.join(dir, specifier));
+      let base;
+      try {
+        base = normalizeProjectPath(path.posix.join(dir, specifier));
+      } catch {
+        continue;
+      }
       if (resolveCandidate(base, byPath)) continue;
       const repaired = buildRepairFile(base, byPath);
       if (!repaired || byPath.has(repaired.path)) continue;
@@ -28,6 +35,19 @@ export function repairMissingRelativeImports(files = []) {
 
   if (!additions.length) return normalized;
   return [...normalized, ...additions].sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function repairRootSourceImports(file, byPath) {
+  if (!/\.(jsx|js)$/.test(file.path) || !String(file.content || '').includes('src/')) return file;
+  const content = String(file.content || '').replace(importRegex, (statement, specifier) => {
+    if (!specifier.startsWith('src/')) return statement;
+    const resolved = resolveCandidate(normalizeProjectPath(specifier), byPath);
+    if (!resolved) return statement;
+    const replacement = relativeImport(file.path, resolved);
+    const quoteIndex = statement.lastIndexOf(specifier);
+    return statement.slice(0, quoteIndex) + replacement + statement.slice(quoteIndex + specifier.length);
+  });
+  return content === file.content ? file : { ...file, content, repaired: true, updatedAt: new Date() };
 }
 
 function resolveCandidate(base, byPath) {

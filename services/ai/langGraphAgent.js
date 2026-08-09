@@ -13,7 +13,9 @@ import { fetchLlmResponse, readLlmResponse, readLlmStream } from './llmTransport
 import { isOpenAiCredentialError } from './openAiErrors.js';
 
 export const MAX_REPAIR_PROMPT_CHARS = 40_000;
-export const MAX_EDIT_PROMPT_CHARS = 40_000;
+export const MAX_EDIT_PROMPT_CHARS = 20_000;
+export const MAX_EDIT_RETRY_PROMPT_CHARS = 12_000;
+export const MAX_CODE_GENERATION_PROMPT_CHARS = 36_000;
 
 const AgentState = Annotation.Root({
   task: Annotation(),
@@ -306,7 +308,11 @@ async function callStructuredAgent({ operation, prompt, fallbackResult, validato
     } catch (error) {
       if (isOpenAiCredentialError(error)) throw error;
       console.warn('LangGraph structured agent output failed', { operation, attempt, message: error.message });
-      attemptPrompt = boundAgentPrompt(operation, buildRetryPrompt(prompt, error));
+      attemptPrompt = boundAgentPrompt(
+        operation,
+        buildRetryPrompt(prompt, error),
+        operation === 'edit' ? MAX_EDIT_RETRY_PROMPT_CHARS : null
+      );
       if (attempt === config.maxRetries) {
         if (fallbackResult) {
           console.warn('LangGraph agent exhausted retries; using validated local fallback', { operation, message: error.message });
@@ -319,13 +325,26 @@ async function callStructuredAgent({ operation, prompt, fallbackResult, validato
   }
 }
 
-export function boundAgentPrompt(operation, prompt) {
+export function boundAgentPrompt(operation, prompt, limitOverride = null) {
   const value = String(prompt || '');
-  const limit = operation === 'generation_repair' ? MAX_REPAIR_PROMPT_CHARS : operation === 'edit' ? MAX_EDIT_PROMPT_CHARS : null;
+  const operationLimit = operation === 'generation_repair'
+    ? MAX_REPAIR_PROMPT_CHARS
+    : operation === 'edit'
+      ? MAX_EDIT_PROMPT_CHARS
+      : operation === 'code_generation'
+        ? MAX_CODE_GENERATION_PROMPT_CHARS
+        : null;
+  const limit = Number.isFinite(limitOverride) && limitOverride > 0 ? Math.floor(limitOverride) : operationLimit;
   if (!limit || value.length <= limit) return value;
+  if (operation === 'code_generation') {
+    const marker = '\n\n[Middle dependency context removed to keep this request within the code-generation safety limit.]\n\n';
+    const headLength = Math.floor((limit - marker.length) * 0.62);
+    const tailLength = limit - marker.length - headLength;
+    return value.slice(0, headLength) + marker + value.slice(-tailLength);
+  }
   const marker = operation === 'generation_repair'
-    ? '\n\n[Optional trailing repair context removed to keep this request within the 40,000-character safety limit.]'
-    : '\n\n[Optional trailing context removed to keep this request within the 40,000-character safety limit.]';
+    ? '\n\n[Optional trailing repair context removed to keep this request within its safety limit.]'
+    : '\n\n[Optional trailing context removed to keep this request within its safety limit.]';
   return value.slice(0, limit - marker.length) + marker;
 }
 

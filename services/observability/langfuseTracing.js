@@ -139,9 +139,8 @@ export async function withLangfuseObservation({ type, operation, provider, model
 export function normalizeOpenAiUsage(usage) {
   if (!usage || typeof usage !== 'object') return {};
   return withoutInvalidNumbers({
-    promptTokens: usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokens,
-    completionTokens: usage.output_tokens ?? usage.completion_tokens ?? usage.completionTokens,
-    totalTokens: usage.total_tokens ?? usage.totalTokens
+    input: usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokens ?? usage.input,
+    output: usage.output_tokens ?? usage.completion_tokens ?? usage.completionTokens ?? usage.output
   });
 }
 

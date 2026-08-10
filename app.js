@@ -12,7 +12,7 @@ const app = express();
 
 app.use(cors({
   origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173',
-  allowedHeaders: ['Content-Type', 'x-visitor-id', 'x-request-id', 'x-openai-api-key', 'x-llm-quality-mode'],
+  allowedHeaders: ['Content-Type', 'x-visitor-id', 'x-request-id', 'x-openai-api-key','x-llm-api-key', 'x-llm-quality-mode'],
   exposedHeaders: ['x-request-id']
 }));
 app.use(express.json({ limit: '1mb' }));
